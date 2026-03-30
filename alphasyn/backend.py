@@ -8,7 +8,10 @@ import shutil
 import subprocess
 import time
 import uuid
+import math
 from pathlib import Path
+
+from memory_utils import run_command_with_peak_memory
 
 from .types import (
     ACTION_TO_ABC_COMMAND,
@@ -32,6 +35,10 @@ class BackendError(RuntimeError):
     """Raised when the ABC backend fails."""
 
 
+AND_REWARD_WEIGHT = 0.7
+LEV_REWARD_WEIGHT = 0.3
+
+
 def parse_abc_and_count(output: str) -> int:
     for pattern in OBJECTIVE_PATTERNS:
         match = pattern.search(output)
@@ -52,20 +59,37 @@ def parse_abc_stats(output: str) -> tuple[int, int]:
     return parse_abc_and_count(output), parse_abc_lev_count(output)
 
 
-def immediate_reward(previous_and_count: int, current_and_count: int, baseline: float) -> float:
+def _signed_sqrt_reward(previous_value: int, current_value: int, baseline: float) -> float:
     if baseline <= 0:
         raise ValueError("baseline must be positive")
-    return (previous_and_count - current_and_count) / baseline
+    reward = math.sqrt(abs(previous_value - current_value) / baseline)
+    return reward if previous_value > current_value else -reward
+
+
+def immediate_reward(
+    previous_and_count: int,
+    current_and_count: int,
+    previous_lev_count: int,
+    current_lev_count: int,
+    and_baseline: float,
+    lev_baseline: float,
+) -> float:
+    and_reward = _signed_sqrt_reward(previous_and_count, current_and_count, and_baseline)
+    lev_reward = _signed_sqrt_reward(previous_lev_count, current_lev_count, lev_baseline)
+    # Keep the total reward in the same range as the current sqrt-normalized reward.
+    return (AND_REWARD_WEIGHT * and_reward) + (LEV_REWARD_WEIGHT * lev_reward)
 
 
 class ABCBackend:
     def __init__(self, abc_bin: str | None, workdir: Path) -> None:
         self.workdir = workdir.resolve()
+        self.cache_root = self.workdir / "cache"
         self.cache_namespace = uuid.uuid4().hex
-        self.cache_dir = self.workdir / "cache" / self.cache_namespace
+        self.cache_dir = self.cache_root / self.cache_namespace
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.abc_bin = abc_bin or self._discover_abc()
         self._version: str | None = None
+        self._peak_memory_kb: float | None = None
 
     def _discover_abc(self) -> str:
         for candidate in ("abc", "yosys-abc", "berkeley-abc"):
@@ -81,14 +105,22 @@ class ABCBackend:
             self._version = self._probe_version()
         return self._version
 
+    def get_peak_memory_kb(self) -> float | None:
+        return self._peak_memory_kb
+
+    def _observe_peak_memory_kb(self, peak_memory_kb: float | None) -> None:
+        if peak_memory_kb is None:
+            return
+        if self._peak_memory_kb is None or peak_memory_kb > self._peak_memory_kb:
+            self._peak_memory_kb = peak_memory_kb
+
     def _probe_version(self) -> str:
         commands = ("version", "print_stats", "help")
         for command in commands:
             try:
-                completed = subprocess.run(
+                completed, _ = run_command_with_peak_memory(
                     [self.abc_bin, "-c", command],
                     check=True,
-                    capture_output=True,
                     text=True,
                 )
             except (OSError, subprocess.CalledProcessError):
@@ -101,14 +133,18 @@ class ABCBackend:
     def compute_baseline(self, design_path: Path) -> BaselineInfo:
         root = self.evaluate_prefix(design_path, ())
         heuristic = self._evaluate_script(design_path, "baseline_resyn2", RESYN2_EXPANDED_ACTIONS)
-        delta = root.and_count - heuristic.and_count
+        and_delta = root.and_count - heuristic.and_count
+        lev_delta = root.lev_count - heuristic.lev_count
         heuristic_steps = len(RESYN2_EXPANDED_ACTIONS)
-        raw_baseline = delta / heuristic_steps if heuristic_steps else 0.0
-        baseline = raw_baseline if raw_baseline > 0 else max(root.and_count / 1000.0, 1.0)
+        raw_baseline = and_delta / heuristic_steps if heuristic_steps else 0.0
+        # baseline = raw_baseline if raw_baseline > 0 else max(root.and_count / 1000.0, 1.0)
+        and_baseline = and_delta if and_delta > 0 else max(root.and_count / 10.0, 1.0)
+        lev_baseline = lev_delta if lev_delta > 0 else max(root.lev_count / 10.0, 1.0)
         return BaselineInfo(
             initial_and_count=root.and_count,
             initial_lev_count=root.lev_count,
-            baseline=baseline,
+            and_baseline=and_baseline,
+            lev_baseline=lev_baseline,
             heuristic_and_count=heuristic.and_count,
             heuristic_lev_count=heuristic.lev_count,
             heuristic_steps=heuristic_steps,
@@ -169,10 +205,9 @@ class ABCBackend:
         )
         started = time.perf_counter()
         try:
-            completed = subprocess.run(
+            completed, peak_memory_kb = run_command_with_peak_memory(
                 [self.abc_bin, "-c", command_string],
                 check=True,
-                capture_output=True,
                 text=True,
             )
         except OSError as exc:
@@ -185,6 +220,7 @@ class ABCBackend:
                 f"Output:\n{payload.strip()}"
             ) from exc
         runtime_sec = time.perf_counter() - started
+        self._observe_peak_memory_kb(peak_memory_kb)
         payload = (completed.stdout + "\n" + completed.stderr).strip()
         and_count, lev_count = parse_abc_stats(payload)
         result = BackendResult(
@@ -194,6 +230,7 @@ class ABCBackend:
             snapshot_path=snapshot_path,
             log=payload,
             cache_hit=False,
+            peak_memory_kb=peak_memory_kb,
         )
         self._store_cached_result(key, result)
         return result
@@ -221,14 +258,17 @@ class ABCBackend:
         snapshot_path = Path(payload["snapshot_path"])
         if not snapshot_path.exists():
             return None
-        return BackendResult(
+        result = BackendResult(
             and_count=int(payload["and"]),
             lev_count=int(payload["lev"]),
             runtime_sec=float(payload["runtime_sec"]),
             snapshot_path=snapshot_path,
             log=str(payload["log"]),
             cache_hit=True,
+            peak_memory_kb=float(payload["peak_memory_kb"]) if payload.get("peak_memory_kb") is not None else None,
         )
+        self._observe_peak_memory_kb(result.peak_memory_kb)
+        return result
 
     def _store_cached_result(self, key: str, result: BackendResult) -> None:
         metadata_path = self._metadata_path(key)
@@ -236,3 +276,9 @@ class ABCBackend:
             json.dumps(result.to_json_dict(), indent=2),
             encoding="ascii",
         )
+
+    def cleanup_cache(self) -> None:
+        if self.cache_dir.exists():
+            shutil.rmtree(self.cache_dir, ignore_errors=True)
+        if self.cache_root.exists() and not any(self.cache_root.iterdir()):
+            self.cache_root.rmdir()

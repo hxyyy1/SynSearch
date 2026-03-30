@@ -25,7 +25,7 @@ ACTION_TO_ABC_COMMAND = {
     "resub-z": "resub -z",
 }
 
-RESYN2_EXPANDED_ACTIONS = (
+RESYN2_EXPANDED_COMMANDS = (
     "balance",
     "rewrite",
     "refactor",
@@ -35,6 +35,19 @@ RESYN2_EXPANDED_ACTIONS = (
     "balance",
     "refactor -z",
     "rewrite -z",
+    "balance",
+)
+
+RESYN2_SEED_ACTIONS = (
+    "balance",
+    "rewrite",
+    "refactor",
+    "balance",
+    "rewrite",
+    "rewrite-z",
+    "balance",
+    "refactor-z",
+    "rewrite-z",
     "balance",
 )
 
@@ -49,12 +62,14 @@ class SearchConfig:
     design_path: Path
     action_space: tuple[str, ...] = DEFAULT_ACTION_SPACE
     sequence_length: int = 24
-    search_iterations: int = 64
-    cpuct: float = 1.0
-    mu_discount: float = 0.9
+    search_iterations: int = 1000
+    and_weight: float = 0.7
+    lev_weight: float = 0.3
+    initial_temperature: float | None = None
+    min_temperature: float = 1e-3
     seed: int = 0
     debug_search: bool = False
-    workdir: Path = Path(".alphasyn_work")
+    workdir: Path = Path(".sasyn_work")
 
     def to_json_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -68,9 +83,7 @@ class BackendResult:
     and_count: int
     lev_count: int
     runtime_sec: float
-    snapshot_path: Path
     log: str
-    cache_hit: bool = False
     peak_memory_kb: float | None = None
 
     def to_json_dict(self) -> dict[str, Any]:
@@ -78,9 +91,7 @@ class BackendResult:
             "and": self.and_count,
             "lev": self.lev_count,
             "runtime_sec": self.runtime_sec,
-            "snapshot_path": str(self.snapshot_path),
             "log": self.log,
-            "cache_hit": self.cache_hit,
             "peak_memory_kb": self.peak_memory_kb,
         }
 
@@ -108,34 +119,36 @@ class BaselineInfo:
 
 
 @dataclass(frozen=True)
-class StepResult:
-    step_index: int
-    selected_action: str
-    prefix: tuple[str, ...]
-    and_count: int
-    lev_count: int
-    root_value: float
-    root_visits: int
-    search_iterations: int
-    action_scores: dict[str, float]
-    action_visits: dict[str, int]
-    action_debug: dict[str, dict[str, float | int]]
-    iteration_traces: tuple[dict[str, Any], ...] = field(default_factory=tuple)
+class IterationResult:
+    iteration: int
+    temperature: float
+    move_type: str
+    accepted: bool
+    delta_energy: float
+    current_and_count: int
+    current_lev_count: int
+    current_energy: float
+    best_and_count: int
+    best_lev_count: int
+    best_energy: float
+    current_sequence: tuple[str, ...]
+    best_sequence: tuple[str, ...]
 
     def to_json_dict(self) -> dict[str, Any]:
         return {
-            "step_index": self.step_index,
-            "selected_action": self.selected_action,
-            "prefix": list(self.prefix),
-            "and": self.and_count,
-            "lev": self.lev_count,
-            "root_value": self.root_value,
-            "root_visits": self.root_visits,
-            "search_iterations": self.search_iterations,
-            "action_scores": self.action_scores,
-            "action_visits": self.action_visits,
-            "action_debug": self.action_debug,
-            "iteration_traces": list(self.iteration_traces),
+            "iteration": self.iteration,
+            "temperature": self.temperature,
+            "move_type": self.move_type,
+            "accepted": self.accepted,
+            "delta_energy": self.delta_energy,
+            "current_and": self.current_and_count,
+            "current_lev": self.current_lev_count,
+            "current_energy": self.current_energy,
+            "best_and": self.best_and_count,
+            "best_lev": self.best_lev_count,
+            "best_energy": self.best_energy,
+            "current_sequence": format_sequence_for_abc(self.current_sequence),
+            "best_sequence": format_sequence_for_abc(self.best_sequence),
         }
 
 
@@ -151,7 +164,7 @@ class SearchResult:
     total_runtime_sec: float
     peak_memory_kb: float | None
     baseline: BaselineInfo
-    steps: tuple[StepResult, ...] = field(default_factory=tuple)
+    iterations: tuple[IterationResult, ...] = field(default_factory=tuple)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_json_dict(self) -> dict[str, Any]:
@@ -166,16 +179,14 @@ class SearchResult:
             "total_runtime_sec": self.total_runtime_sec,
             "peak_memory_kb": self.peak_memory_kb,
             "baseline": self.baseline.to_json_dict(),
-            "steps": [step.to_json_dict() for step in self.steps],
+            "iterations": [iteration.to_json_dict() for iteration in self.iterations],
             "metadata": self.metadata,
         }
 
 
 class SynthesisBackend(Protocol):
-    """Backend interface for ABC-driven prefix evaluation."""
-
     def version(self) -> str: ...
 
     def compute_baseline(self, design_path: Path) -> BaselineInfo: ...
 
-    def evaluate_prefix(self, design_path: Path, prefix: tuple[str, ...]) -> BackendResult: ...
+    def evaluate_sequence(self, design_path: Path, sequence: tuple[str, ...]) -> BackendResult: ...

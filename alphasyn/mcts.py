@@ -46,6 +46,34 @@ def _selection_score(parent: Node, edge: Edge, cpuct: float) -> float:
     return edge.q_value + edge.reward + exploration
 
 
+def _exploration_score(parent: Node, edge: Edge, cpuct: float) -> float:
+    return cpuct * edge.prior * math.sqrt(max(parent.visits, 1)) / (edge.visits + 1)
+
+
+def _node_debug_snapshot(node: Node, config: SearchConfig) -> dict[str, object]:
+    return {
+        "prefix": list(node.prefix),
+        "and": node.and_count,
+        "lev": node.backend_result.lev_count,
+        "visits": node.visits,
+        "value": node.value,
+        "children": {
+            action: {
+                "q": edge.q_value,
+                "r": edge.reward,
+                "u": _exploration_score(node, edge, config.cpuct),
+                "q_plus_r": edge.q_value + edge.reward,
+                "selection_score": _selection_score(node, edge, config.cpuct),
+                "visits": edge.visits,
+                "prior": edge.prior,
+                "child_and": edge.child.and_count,
+                "child_lev": edge.child.backend_result.lev_count,
+            }
+            for action, edge in node.children.items()
+        },
+    }
+
+
 def _expand_node(
     node: Node,
     config: SearchConfig,
@@ -65,7 +93,14 @@ def _expand_node(
             and_count=backend_result.and_count,
             backend_result=backend_result,
         )
-        reward = immediate_reward(node.and_count, child.and_count, baseline.baseline)
+        reward = immediate_reward(
+            node.and_count,
+            child.and_count,
+            node.backend_result.lev_count,
+            child.backend_result.lev_count,
+            baseline.and_baseline,
+            baseline.lev_baseline,
+        )
         node.children[action] = Edge(
             action=action,
             prior=uniform_prior,
@@ -104,34 +139,90 @@ def _backpropagate(path: list[tuple[Node, Edge]], config: SearchConfig) -> None:
         _recompute_value(node, config.mu_discount)
 
 
-def _run_iteration(root: Node, config: SearchConfig, baseline: BaselineInfo, backend: SynthesisBackend) -> None:
+def _run_iteration(
+    root: Node,
+    config: SearchConfig,
+    baseline: BaselineInfo,
+    backend: SynthesisBackend,
+    iteration_index: int,
+) -> dict[str, object] | None:
     node = root
     path: list[tuple[Node, Edge]] = []
+    selected_actions: list[str] = []
+    expanded_node: Node | None = None
 
     while True:
         if len(node.prefix) >= config.sequence_length:
             break
         if not node.children:
             _expand_node(node, config, baseline, backend)
+            expanded_node = node
             break
         edge = max(
             node.children.values(),
             key=lambda current: (_selection_score(node, current, config.cpuct), current.action),
         )
         path.append((node, edge))
+        selected_actions.append(edge.action)
         node = edge.child
 
     _backpropagate(path, config)
     _recompute_value(root, config.mu_discount)
+    if not config.debug_search:
+        return None
+
+    traced_nodes: list[Node] = []
+    seen_node_ids: set[int] = set()
+    for current_node, edge in path:
+        if id(current_node) not in seen_node_ids:
+            traced_nodes.append(current_node)
+            seen_node_ids.add(id(current_node))
+        if id(edge.child) not in seen_node_ids:
+            traced_nodes.append(edge.child)
+            seen_node_ids.add(id(edge.child))
+    if expanded_node is not None and id(expanded_node) not in seen_node_ids:
+        traced_nodes.append(expanded_node)
+        seen_node_ids.add(id(expanded_node))
+    if not traced_nodes:
+        traced_nodes.append(root)
+
+    return {
+        "iteration_index": iteration_index,
+        "selected_actions": selected_actions,
+        "expanded_prefix": list(expanded_node.prefix) if expanded_node is not None else None,
+        "root_value": root.value,
+        "root_visits": root.visits,
+        "nodes": [_node_debug_snapshot(traced_node, config) for traced_node in traced_nodes],
+    }
 
 
-def _step_summary(step_index: int, root: Node, selected_action: str, config: SearchConfig) -> StepResult:
+def _step_summary(
+    step_index: int,
+    root: Node,
+    selected_action: str,
+    config: SearchConfig,
+    iteration_traces: tuple[dict[str, object], ...],
+) -> StepResult:
     action_scores = {
         action: edge.q_value + edge.reward
         for action, edge in root.children.items()
     }
     action_visits = {
         action: edge.visits
+        for action, edge in root.children.items()
+    }
+    action_debug = {
+        action: {
+            "q": edge.q_value,
+            "r": edge.reward,
+            "u": _exploration_score(root, edge, config.cpuct),
+            "q_plus_r": edge.q_value + edge.reward,
+            "selection_score": _selection_score(root, edge, config.cpuct),
+            "visits": edge.visits,
+            "prior": edge.prior,
+            "child_and": edge.child.and_count,
+            "child_lev": edge.child.backend_result.lev_count,
+        }
         for action, edge in root.children.items()
     }
     selected_edge = root.children[selected_action]
@@ -142,9 +233,12 @@ def _step_summary(step_index: int, root: Node, selected_action: str, config: Sea
         and_count=selected_edge.child.and_count,
         lev_count=selected_edge.child.backend_result.lev_count,
         root_value=root.value,
+        root_visits=root.visits,
         search_iterations=config.search_iterations,
         action_scores=action_scores,
         action_visits=action_visits,
+        action_debug=action_debug,
+        iteration_traces=iteration_traces,
     )
 
 
@@ -157,17 +251,29 @@ def run_search(config: SearchConfig, backend: SynthesisBackend) -> SearchResult:
     steps: list[StepResult] = []
 
     for step_index in range(1, config.sequence_length + 1):
-        for _ in range(config.search_iterations):
-            _run_iteration(root, config, baseline, backend)
+        iteration_traces: list[dict[str, object]] = []
+        for iteration_index in range(1, config.search_iterations + 1):
+            trace = _run_iteration(root, config, baseline, backend, iteration_index)
+            if trace is not None:
+                iteration_traces.append(trace)
         if not root.children:
             break
         selected_edge = max(
             root.children.values(),
             key=lambda edge: (edge.q_value + edge.reward, edge.action),
         )
-        steps.append(_step_summary(step_index, root, selected_edge.action, config))
+        steps.append(
+            _step_summary(
+                step_index,
+                root,
+                selected_edge.action,
+                config,
+                tuple(iteration_traces),
+            )
+        )
         root = selected_edge.child
 
+    peak_memory_getter = getattr(backend, "get_peak_memory_kb", None)
     return SearchResult(
         design_name=config.design_name,
         design_path=config.design_path,
@@ -177,6 +283,7 @@ def run_search(config: SearchConfig, backend: SynthesisBackend) -> SearchResult:
         final_and_count=root.and_count,
         final_lev_count=root.backend_result.lev_count,
         total_runtime_sec=time.perf_counter() - started,
+        peak_memory_kb=peak_memory_getter() if callable(peak_memory_getter) else None,
         baseline=baseline,
         steps=tuple(steps),
         metadata={

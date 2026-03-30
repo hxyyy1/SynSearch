@@ -1,18 +1,30 @@
 # MCTSyn
 
-`MCTSyn` contains a minimal `AlphaSyn w/o nn` implementation for BLIF designs, using a Python MCTS front-end and an `ABC` backend.
+`MCTSyn` now hosts three BLIF logic synthesis search implementations in one repository:
 
-## Scope
+- `alphasyn`: a minimal `AlphaSyn w/o nn` flow with MCTS
+- `SASyn`: a minimal simulated annealing flow
+- `MABSyn`: multi-armed bandit baselines with UCB1 and LinUCB
 
-- `--dataset-root` should point to the folder that contains the target `.blif` files
-- The scan is recursive, so folders such as `benchmarks/VTR`, `benchmarks/EPFL`, or any future subfolder layout are supported
-- Backend only targets `ABC`
+All implementations target `ABC`. `alphasyn` and `SASyn` reuse the checked-in `tc_public/` and `benchmarks/` directories, while `MABSyn` reuses the checked-in `tc_public/` directory. The algorithms remain separate: the MCTS path stays under `alphasyn/`, the simulated annealing path stays under `SASyn/`, and the bandit baselines stay under `MABSyn/`.
+
+## Shared Scope
+
+- `--dataset-root` points to the directory that contains target `.blif` files
+- Dataset scan is recursive, so layouts such as `benchmarks/VTR`, `benchmarks/EPFL`, or nested `tc_public/*` are supported
+- If duplicate filenames exist under one dataset root, the CLI automatically uses relative paths such as `tc_public_1/input.blif` as design names
+- Backend targets `ABC` only
 - Action space is fixed to `balance`, `rewrite`, `rewrite-z`, `refactor`, `refactor-z`, `resub`, `resub-z`
-- No neural network, no fixed subsequence injection, no resource allocator, no parallel search
 
-## Commands
+Set up `ABC` in `PATH` or pass `--abc-bin` explicitly:
 
+```bash
 export PATH="$HOME/abc:$PATH"
+```
+
+## `alphasyn` (MCTS)
+
+`alphasyn` keeps the original MCTSyn behavior: step-wise MCTS with `Q + R + U` selection, `Q + R` root action choice, tree reuse, no neural network, no fixed subsequence injection, no resource allocator, and no parallel search.
 
 Prepare a dataset manifest:
 
@@ -25,17 +37,24 @@ Run the core search:
 
 ```bash
 python -m alphasyn run-search --abc-bin /path/to/abc --search-iterations 64 --sequence-length 24
-python -m alphasyn run-search --dataset-root tc_public/tc_public_1 --design input.blif --sequence-length 10 --search-iterations 10
+python -m alphasyn run-search --dataset-root tc_public --design tc_public_1/input.blif --sequence-length 10 --search-iterations 10
+python -m alphasyn run-search --dataset-root tc_public --sequence-length 10 --search-iterations 10 --cpuct 1.0
 python -m alphasyn run-search --dataset-root benchmarks/VTR --design bfly.abc.blif --sequence-length 10 --search-iterations 20
-python -m alphasyn run-search --dataset-root benchmarks/VTR --sequence-length 10 --search-iterations 10
+python -m alphasyn run-search --dataset-root benchmarks/VTR --sequence-length 10 --search-iterations 30 --cpuct 1.0
+python -m alphasyn run-search --dataset-root benchmarks/VTR --design bfly.abc.blif --debug-search
 ```
 
+Aggregate JSON results into CSV:
+
+```bash
+python -m alphasyn summarize
+```
 
 Common parameters:
 
 - `--dataset-root benchmarks/VTR`: choose the concrete folder to scan
 - `--design bfly.abc.blif`: choose one exact `.blif` filename under that folder; omit it to run all files in the folder tree
-- If one `--dataset-root` contains duplicate filenames, narrow the folder path further so each `.blif` filename is unique
+- `--debug-search`: save per-step root action `Q/R/U/visits` under `steps[*].action_debug`, save per-iteration node traces under `steps[*].iteration_traces`, and emit debug CSV files beside the JSON
 - `--abc-bin /home/hxy/abc/abc`: explicit `ABC` path; omit it if `abc` is already in `PATH`
 - `--sequence-length 24`: search sequence length
 - `--search-iterations 64`: MCTS iterations per step
@@ -44,30 +63,115 @@ Common parameters:
 - `--seed 0`: random seed
 - `--workdir .alphasyn_work`: output directory; it must stay inside the current project directory
 
+Outputs:
+
+- Default output directory is `.alphasyn_work/`
+- `results/*.json` stores detailed search results
+- `results/*.debug.csv` stores one row per `(step, action)` when `--debug-search` is enabled
+- `results/*.trace.csv` stores one row per `(step, iteration, node, action)` when `--debug-search` is enabled
+- `cache/` is namespaced per `run-search` invocation and is automatically deleted when that run finishes
+- `summary.csv` stores one row per design, comparing `resyn2` heuristic results against MCTS results
+
+## `SASyn` (Simulated Annealing)
+
+`SASyn` keeps the original simulated annealing behavior: full-sequence search with the normalized final cost
+`0.7 * (and / initial_and) + 0.3 * (lev / initial_lev)`.
+
+Prepare a dataset manifest:
+
+```bash
+python -m SASyn prepare-data
+python -m SASyn prepare-data --dataset-root benchmarks/VTR
+```
+
+Run simulated annealing search:
+
+```bash
+python -m SASyn run-search --dataset-root tc_public --design tc_public_1/input.blif --sequence-length 10 --search-iterations 1000
+python -m SASyn run-search --dataset-root tc_public --sequence-length 10 --search-iterations 1000
+python -m SASyn run-search --dataset-root benchmarks/VTR --design bfly.abc.blif --search-iterations 2000 --debug-search
+```
+
 Aggregate JSON results into CSV:
 
 ```bash
-python -m alphasyn summarize
+python -m SASyn summarize
 ```
 
-The summary table is one row per design with these columns:
+Common parameters:
 
-- `design_name`
-- `initial_and`
-- `initial_lev`
-- `heuristic_and`
-- `heuristic_lev`
-- `final_and`
-- `final_lev`
+- `--dataset-root`: root directory containing `.blif` files
+- `--design`: run one exact design under the dataset root; omit it to run all discovered designs
+- `--sequence-length`: fixed sequence length used by simulated annealing
+- `--search-iterations`: total annealing iterations
+- `--and-weight`: weight of normalized AND count in the final cost
+- `--lev-weight`: weight of normalized level count in the final cost
+- `--initial-temperature`: override the auto-calibrated starting temperature
+- `--min-temperature`: lower bound of the geometric cooling schedule
+- `--seed`: random seed
+- `--debug-search`: emit per-iteration CSV traces
+- `--workdir .sasyn_work`: output directory; it must stay inside the current project directory
 
-## Outputs
+Outputs:
 
-- All generated files stay under the current project directory
-- Default output directory is `.alphasyn_work/`
-- `results/*.json` stores detailed search results
-- `cache/` is namespaced per `run-search` invocation, so rerunning the same command will evaluate prefixes again instead of reusing a previous run's on-disk cache
-- In each result JSON, `sequence` is stored as a plain `ABC` command string that can be copied directly into `abc`
-- `summary.csv` stores one row per design, comparing `resyn2` heuristic results against MCTS results
+- Default output directory is `.sasyn_work/`
+- `manifest.json`: dataset manifest
+- `base_aig/`: per-design temporary AIG starting points generated from input BLIF files
+- `results/*.json`: per-design search results
+- `results/*.debug.csv`: per-iteration trace when `--debug-search` is enabled
+- `summary.csv`: aggregated report
+
+Each SA result JSON includes the final sequence as an `ABC` command string, final `and` and `lev`, baseline information derived from the initial design and `resyn2`, and the full annealing trace under `iterations`.
+
+## `MABSyn` (Bandit Baselines)
+
+`MABSyn` keeps two original bandit-style baselines:
+
+- `baseline_mab`: UCB1 sequence search
+- `linucb`: contextual bandit search with LinUCB
+
+Both are now invoked as modules and store generated files under `.mabsyn_work/` by default.
+
+Single-design commands:
+
+```bash
+python -m MABSyn.baseline_mab tc_public/tc_public_1/input.blif --episodes 20 --steps 10 --ucb-c 1.5
+python -m MABSyn.linucb tc_public/tc_public_1/input.blif --episodes 20 --steps 10
+```
+
+Batch commands:
+
+```bash
+python -m MABSyn.baseline_mab_batch --episodes 20 --steps 10
+python -m MABSyn.linucb_batch --episodes 20 --steps 10
+```
+
+Summaries:
+
+```bash
+python -m MABSyn.summarize_results baseline_mab
+python -m MABSyn.summarize_results linucb
+```
+
+Common parameters:
+
+- `--workdir .mabsyn_work`: root directory for result JSON, summaries, and caches
+- `--abc-bin`: explicit `ABC` path
+- `--steps`: fixed sequence length or steps per episode
+- `--episodes`: total episodes / iterations used by the method
+- `--seed`: random seed
+- `--actions`: comma-separated action override
+- `--result-json`: optional explicit aggregate output path
+
+Method-specific parameters remain unchanged, including `--ucb-c` for `baseline_mab` and `--alpha`, `--linucb-alpha`, `--lambda`, `--linucb-lambda`, `--long-term-rollouts`, and `--long-term-horizon` for `linucb`.
+
+Outputs:
+
+- Default root is `.mabsyn_work/`
+- `baseline_mab` and `linucb` no longer write default aggregate `*_results.json` files; pass `--result-json` if you want one
+- Per-benchmark results are stored under `.mabsyn_work/results/baseline_mab/` and `.mabsyn_work/results/linucb/`
+- Summary CSV is written under `.mabsyn_work/results/summary.csv` or per-method summary paths
+- LinUCB cache files are written under `.mabsyn_work/cache/linucb/`
 
 ## Testing
 
@@ -77,17 +181,6 @@ The repository uses the standard library `unittest` suite:
 python -m unittest discover -s tests -v
 ```
 
-
-
-项目构成：
-alphasyn/cli.py：命令行入口，提供 prepare-data、run-search、summarize 三个子命令。
-alphasyn/types.py：核心数据结构，定义了 SearchConfig、SearchResult、BaselineInfo、BackendResult，也放了固定动作空间和 baseline 用的启发式脚本展开序列。
-alphasyn/backend.py：ABC 后端封装。负责：读取 tc_public/*/input.blif，执行动作前缀，调 print_stats 解析 and = ...，把每个前缀结果缓存到 .alphasyn_work/cache/
-alphasyn/mcts.py：AlphaSyn w/o nn 的核心搜索逻辑。当前实现是：单线程、无神经网络、无资源分配、无固定子序列注入、Selection 用 Q + R + U、最终决策用根节点 argmax(Q + R)、树复用开启
-alphasyn/dataset.py：扫描 tc_public、生成 manifest、做文件 hash。
-tests/test_core.py：不依赖真实 ABC 的单元测试，覆盖奖励、解析和 MCTS 决策。
-README.md：基础说明。
-
-数据和输出：
-输入数据固定在 tc_public 下，目录形如 tc_public_1/input.blif。
-运行后默认输出到 .alphasyn_work/：manifest.json、cache/*.aig 和 cache/*.json、results/*.json、summary.csv
+python compare_algorithm_summaries.py \
+  --output your_aggregate.csv \
+  --details-output your_details.csv

@@ -1,3 +1,6 @@
 .alphasyn_work/
+.sasyn_work/
+.mabsyn_work/
 __pycache__/
 *.pyc
+.codex

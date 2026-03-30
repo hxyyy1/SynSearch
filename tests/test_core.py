@@ -21,7 +21,8 @@ class FakeBackend:
         return BaselineInfo(
             initial_and_count=self.and_count_map[()],
             initial_lev_count=max(0, self.and_count_map[()] // 10),
-            baseline=10.0,
+            and_baseline=10.0,
+            lev_baseline=1.0,
             heuristic_and_count=self.and_count_map[()],
             heuristic_lev_count=max(0, self.and_count_map[()] // 10),
             heuristic_steps=12,
@@ -48,9 +49,15 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(parse_abc_and_count("i/o = 3/1 nd = 77 edge = 110"), 77)
         self.assertEqual(parse_abc_stats("and = 42 lev = 9"), (42, 9))
 
-    def test_immediate_reward_uses_ratio_normalization(self) -> None:
-        self.assertEqual(immediate_reward(100, 90, 5.0), 2.0)
-        self.assertEqual(immediate_reward(90, 100, 5.0), -2.0)
+    def test_immediate_reward_blends_and_and_lev_without_rescaling(self) -> None:
+        self.assertAlmostEqual(
+            immediate_reward(100, 90, 20, 16, 5.0, 2.0),
+            2**0.5,
+        )
+        self.assertAlmostEqual(
+            immediate_reward(90, 100, 16, 20, 5.0, 2.0),
+            -(2**0.5),
+        )
 
     def test_search_prefers_best_q_plus_r_and_reuses_tree(self) -> None:
         and_counts = {
@@ -81,6 +88,7 @@ class CoreTests(unittest.TestCase):
             cpuct=1.0,
             mu_discount=0.9,
             seed=0,
+            debug_search=True,
             workdir=test_workdir,
         )
         try:
@@ -101,6 +109,13 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(payload["baseline"]["initial_and"], 100)
         self.assertEqual(payload["steps"][0]["and"], 80)
         self.assertEqual(payload["steps"][0]["lev"], 8)
+        self.assertEqual(payload["steps"][0]["root_visits"], 3)
+        self.assertIn("q", payload["steps"][0]["action_debug"]["rewrite"])
+        self.assertIn("r", payload["steps"][0]["action_debug"]["rewrite"])
+        self.assertIn("u", payload["steps"][0]["action_debug"]["rewrite"])
+        self.assertIn("selection_score", payload["steps"][0]["action_debug"]["rewrite"])
+        self.assertTrue(payload["steps"][0]["iteration_traces"])
+        self.assertIn("nodes", payload["steps"][0]["iteration_traces"][0])
         self.assertEqual(payload["sequence"], "rewrite; balance")
         self.assertEqual(format_sequence_for_abc(result.sequence), "rewrite; balance")
 

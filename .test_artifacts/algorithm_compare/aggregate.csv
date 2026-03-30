@@ -1,0 +1,4 @@
+algorithm,design_count,weighted_cost,final_score,summary_path,avg_and,avg_norm_and,avg_lev,avg_norm_lev,avg_runtime,avg_norm_runtime
+SASyn,2,0.7031439495902747,21.872894489969475,/home/hxy/MCTSyn/.sasyn_work/summary.csv,3032.0,0.8711010898158587,15.0,1.0,8.953386233999481,0.33796702341172674
+MABSyn,2,0.7359879289595436,18.223563448939608,/home/hxy/MCTSyn/.mabsyn_work/results/baseline_mab/summary.csv,4057.0,0.9712230215827338,14.0,0.9545454545454546,8.153,0.29733663629542867
+MCTSyn,2,0.7793544645681426,13.4050594924286,/home/hxy/MCTSyn/.alphasyn_work/summary.csv,2360.5,0.7587089291362852,15.0,1.0,22.426626951004437,1.0
