@@ -63,8 +63,8 @@ class SearchConfig:
     action_space: tuple[str, ...] = DEFAULT_ACTION_SPACE
     sequence_length: int = 24
     search_iterations: int = 1000
-    and_weight: float = 0.7
-    lev_weight: float = 0.3
+    and_weight: float = 0.5
+    lev_weight: float = 0.2
     initial_temperature: float | None = None
     min_temperature: float = 1e-3
     seed: int = 0

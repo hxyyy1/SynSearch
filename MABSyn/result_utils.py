@@ -154,6 +154,9 @@ def extract_table_rows(rows: Sequence[Dict]) -> List[List[str]]:
     for row in rows:
         payload = row["payload"]
         best = payload.get("best", {})
+        config = payload.get("config", {})
+        if not isinstance(config, dict):
+            config = {}
         runtime_sec = payload.get("runtime_sec")
         peak_memory_kb = payload.get("peak_memory_kb")
         runtime_text = "-"
@@ -162,9 +165,40 @@ def extract_table_rows(rows: Sequence[Dict]) -> List[List[str]]:
             runtime_text = f"{float(runtime_sec):.3f}"
         if isinstance(peak_memory_kb, (int, float)):
             peak_memory_text = f"{float(peak_memory_kb):.0f}"
+        steps = config.get("steps_per_episode", config.get("steps_per_sequence", "-"))
+        iterations = config.get("episodes", config.get("iterations_per_step", "-"))
+        seed = config.get("seed", "-")
+        ucb_c = config.get("ucb_c", "-")
+        alpha = config.get("alpha", "-")
+        reg_lambda = config.get("lambda", "-")
+        and_reward_weight = config.get("and_reward_weight", "-")
+        lev_reward_weight = config.get("lev_reward_weight", "-")
+        variant_parts = [f"steps={steps}", f"iters={iterations}"]
+        if ucb_c != "-":
+            variant_parts.append(f"ucb_c={ucb_c}")
+        # if alpha != "-":
+        #     variant_parts.append(f"alpha={alpha}")
+        # if reg_lambda != "-":
+        #     variant_parts.append(f"lambda={reg_lambda}")
+        # if and_reward_weight != "-":
+        #     variant_parts.append(f"and_w={and_reward_weight}")
+        # if lev_reward_weight != "-":
+        #     variant_parts.append(f"lev_w={lev_reward_weight}")
+        if seed != "-":
+            variant_parts.append(f"seed={seed}")
+        variant_label = ",".join(variant_parts)
         table_rows.append(
             [
                 str(payload.get("benchmark", row["result_file"])),
+                variant_label,
+                # str(steps),
+                # str(iterations),
+                # str(seed),
+                # str(ucb_c),
+                # str(alpha),
+                # str(reg_lambda),
+                # str(and_reward_weight),
+                # str(lev_reward_weight),
                 str(best.get("nodes", "-")),
                 str(best.get("level", "-")),
                 runtime_text,

@@ -12,6 +12,7 @@
 """
 
 import json
+import argparse
 import logging
 import os
 import queue
@@ -24,12 +25,13 @@ import threading
 import time
 import uuid
 import hashlib
+from pathlib import Path
 from dataclasses import asdict, dataclass
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 import numpy as np
 
 from memory_utils import read_linux_peak_memory_kb
-from . import result_utils
+from . import result_utils, summarize_results
 
 
 # ------------------------------
@@ -1417,97 +1419,191 @@ def setup_logging() -> None:
     )
 
 
-def main() -> None:
+def _resolve_local_path(path: Path) -> Path:
+    cwd = Path.cwd().resolve()
+    candidate = (cwd / path).resolve() if not path.is_absolute() else path.resolve()
+    if not candidate.is_relative_to(cwd):
+        raise SystemExit(f"Path '{path}' must stay under the current working directory: {cwd}")
+    return candidate
+
+
+def _discover_designs_or_exit(dataset_root: Path) -> dict[str, str]:
+    files = find_blif_files(str(dataset_root))
+    if not files:
+        raise SystemExit(f"未找到 .blif 文件，请检查目录: {dataset_root}")
+    return {
+        os.path.relpath(os.path.abspath(blif_path), str(dataset_root.resolve())).replace("\\", "/"): blif_path
+        for blif_path in files
+    }
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="linucb")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    run = subparsers.add_parser("run-search", help="Run LinUCB search.")
+    run.add_argument("--workdir", type=Path, default=Path(result_utils.DEFAULT_WORKDIR_NAME))
+    run.add_argument("--abc-bin", default=ABC_BIN)
+    run.add_argument("--dataset-root", type=Path, default=Path("tc_public"))
+    run.add_argument("--design", help="Single .blif filename under dataset-root. Default: run all.")
+    run.add_argument("--steps", type=int, default=K_STEPS)
+    run.add_argument("--episodes", type=int, default=N_EPISODES)
+    run.add_argument("--timeout", type=int, default=ABC_TIMEOUT_SEC)
+    run.add_argument("--spike-factor", type=float, default=SPIKE_FACTOR)
+    run.add_argument("--severe-negative-reward", type=float, default=SEVERE_NEGATIVE_REWARD)
+    run.add_argument("--timeout-negative-reward", type=float, default=TIMEOUT_NEGATIVE_REWARD)
+    run.add_argument("--seed", type=int, default=RANDOM_SEED)
+    run.add_argument("--alpha", type=float, default=ALPHA)
+    run.add_argument("--linucb-alpha", type=float, default=None)
+    run.add_argument("--ucb-c", type=float, default=None)
+    run.add_argument("--lambda", dest="reg_lambda", type=float, default=REG_LAMBDA)
+    run.add_argument("--linucb-lambda", type=float, default=None)
+    run.add_argument("--long-term-rollouts", type=int, default=LONG_TERM_ROLLOUTS)
+    run.add_argument("--long-term-horizon", type=int, default=LONG_TERM_HORIZON)
+    run.add_argument("--return-back-threshold", type=float, default=RETURN_BACK_THRESHOLD)
+    run.add_argument("--actions", default=None)
+    run.add_argument("--result-json", type=Path, default=None)
+    run.add_argument("--log-level", default="INFO")
+
+    summarize = subparsers.add_parser("summarize", help="Aggregate JSON search results into CSV.")
+    summarize.add_argument("--workdir", type=Path, default=Path(result_utils.DEFAULT_WORKDIR_NAME))
+    return parser
+
+
+def _configure_runtime_from_args(args: argparse.Namespace) -> None:
     global K_STEPS, N_EPISODES, ABC_TIMEOUT_SEC, SPIKE_FACTOR
     global SEVERE_NEGATIVE_REWARD, TIMEOUT_NEGATIVE_REWARD, RANDOM_SEED
     global ALPHA, REG_LAMBDA, LONG_TERM_ROLLOUTS, LONG_TERM_HORIZON
     global RETURN_BACK_THRESHOLD
-
-    design, kv = parse_runtime_args(sys.argv)
-
-    abc_bin = kv.get("abc-bin", ABC_BIN)
-    workdir = kv.get("workdir", result_utils.DEFAULT_WORKDIR_NAME)
-    result_utils.set_workdir(workdir)
-    result_json = result_utils.optional_output_path(
-        kv,
-        "result-json",
-    )
-    log_level = kv.get("log-level", "INFO").upper()
-
-    K_STEPS = int(kv.get("steps", str(K_STEPS)))
-    N_EPISODES = int(kv.get("episodes", str(N_EPISODES)))
-    ABC_TIMEOUT_SEC = int(kv.get("timeout", str(ABC_TIMEOUT_SEC)))
-    SPIKE_FACTOR = float(kv.get("spike-factor", str(SPIKE_FACTOR)))
-    SEVERE_NEGATIVE_REWARD = float(
-        kv.get("severe-negative-reward", str(SEVERE_NEGATIVE_REWARD))
-    )
-    TIMEOUT_NEGATIVE_REWARD = float(
-        kv.get("timeout-negative-reward", str(TIMEOUT_NEGATIVE_REWARD))
-    )
-    RANDOM_SEED = int(kv.get("seed", str(RANDOM_SEED)))
-
-    # 兼容旧参数 --ucb-c；新参数优先级更高。
-    alpha_str = kv.get("alpha", kv.get("linucb-alpha", kv.get("ucb-c", str(ALPHA))))
-    lambda_str = kv.get("lambda", kv.get("linucb-lambda", str(REG_LAMBDA)))
-    ALPHA = float(alpha_str)
-    REG_LAMBDA = float(lambda_str)
-    LONG_TERM_ROLLOUTS = int(kv.get("long-term-rollouts", str(LONG_TERM_ROLLOUTS)))
-    LONG_TERM_HORIZON = int(kv.get("long-term-horizon", str(LONG_TERM_HORIZON)))
-    RETURN_BACK_THRESHOLD = float(
-        kv.get("return-back-threshold", str(RETURN_BACK_THRESHOLD))
-    )
-
-    if "actions" in kv:
-        parsed_actions = [x.strip() for x in kv["actions"].split(",") if x.strip()]
+    K_STEPS = args.steps
+    N_EPISODES = args.episodes
+    ABC_TIMEOUT_SEC = args.timeout
+    SPIKE_FACTOR = args.spike_factor
+    SEVERE_NEGATIVE_REWARD = args.severe_negative_reward
+    TIMEOUT_NEGATIVE_REWARD = args.timeout_negative_reward
+    RANDOM_SEED = args.seed
+    ALPHA = args.alpha
+    if args.linucb_alpha is not None:
+        ALPHA = args.linucb_alpha
+    if args.ucb_c is not None:
+        ALPHA = args.ucb_c
+    REG_LAMBDA = args.reg_lambda
+    if args.linucb_lambda is not None:
+        REG_LAMBDA = args.linucb_lambda
+    LONG_TERM_ROLLOUTS = args.long_term_rollouts
+    LONG_TERM_HORIZON = args.long_term_horizon
+    RETURN_BACK_THRESHOLD = args.return_back_threshold
+    if args.actions:
+        parsed_actions = [x.strip() for x in args.actions.split(",") if x.strip()]
         if parsed_actions:
             actions[:] = parsed_actions
 
+
+def _command_run_search(args: argparse.Namespace) -> int:
+    args.workdir = _resolve_local_path(args.workdir)
+    result_utils.set_workdir(str(args.workdir))
+    result_json = _resolve_local_path(args.result_json) if args.result_json else None
+    _configure_runtime_from_args(args)
+
     setup_logging()
-    logging.getLogger().setLevel(getattr(logging, log_level, logging.INFO))
+    logging.getLogger().setLevel(getattr(logging, args.log_level.upper(), logging.INFO))
     random.seed(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
 
-    if design is not None:
-        if not os.path.isfile(design):
-            logging.error("design 文件不存在: %s", design)
-            return
+    logging.info("ABC二进制: %s", args.abc_bin)
+    logging.info("Benchmark目录: %s", os.path.abspath(args.dataset_root))
+    logging.info(
+        "参数: steps=%d iters_per_step=%d timeout=%d alpha=%.3f lambda=%.3f "
+        "rollouts=%d horizon=%d return_back_threshold=%.4f seed=%d",
+        K_STEPS,
+        N_EPISODES,
+        ABC_TIMEOUT_SEC,
+        ALPHA,
+        REG_LAMBDA,
+        LONG_TERM_ROLLOUTS,
+        LONG_TERM_HORIZON,
+        RETURN_BACK_THRESHOLD,
+        RANDOM_SEED,
+    )
 
-        logging.info("单电路模式: design=%s", os.path.abspath(design))
-        logging.info(
-            "参数: steps=%d iters_per_step=%d timeout=%d alpha=%.3f lambda=%.3f "
-            "rollouts=%d horizon=%d return_back_threshold=%.4f seed=%d",
-            K_STEPS,
-            N_EPISODES,
-            ABC_TIMEOUT_SEC,
-            ALPHA,
-            REG_LAMBDA,
-            LONG_TERM_ROLLOUTS,
-            LONG_TERM_HORIZON,
-            RETURN_BACK_THRESHOLD,
-            RANDOM_SEED,
-        )
+    designs = _discover_designs_or_exit(args.dataset_root)
+    if args.design:
+        if args.design not in designs:
+            available = ", ".join(sorted(designs))
+            raise SystemExit(f"Unknown design '{args.design}'. Available designs: {available}")
+        selected = {args.design: designs[args.design]}
+    else:
+        selected = designs
 
+    all_results = {
+        "meta": {
+            "abc_bin": args.abc_bin,
+            "benchmark_dir": os.path.abspath(args.dataset_root),
+            "num_benchmarks": len(selected),
+            "alpha": ALPHA,
+            "lambda": REG_LAMBDA,
+            "long_term_rollouts": LONG_TERM_ROLLOUTS,
+            "long_term_horizon": LONG_TERM_HORIZON,
+            "return_back_threshold": RETURN_BACK_THRESHOLD,
+            "seed": RANDOM_SEED,
+        },
+        "results": [],
+    }
+
+    for design_name, design_path in selected.items():
         result = optimize_one_benchmark(
-            design,
+            design_path,
+            benchmark_name=design_name,
             alpha=ALPHA,
             reg_lambda=REG_LAMBDA,
-            abc_bin=abc_bin,
+            abc_bin=args.abc_bin,
             seed=RANDOM_SEED,
         )
         result["meta"] = {
-            "mode": "single_design",
-            "abc_bin": abc_bin,
+            "mode": "single_design" if args.design else "batch",
+            "abc_bin": args.abc_bin,
         }
-
+        all_results["results"].append(result)
         result_path = write_result_artifacts(result)
-        if result_json:
-            with open(result_json, "w", encoding="utf-8") as f:
-                json.dump(result, f, indent=2, ensure_ascii=False)
-        logging.info("完成，结果已写入: %s", os.path.abspath(result_path))
-        return
+        logging.info("完成: %s -> %s", design_name, os.path.abspath(result_path))
 
-    logging.error("批量模式已拆分，请使用 baseline_linucb_batch.py")
+    all_results["summary"] = build_summary(all_results["results"])
+    summary_path = result_utils.write_method_summary("linucb", all_results)
+    if result_json:
+        with open(result_json, "w", encoding="utf-8") as f:
+            json.dump(all_results, f, indent=2, ensure_ascii=False)
+
+    summary = all_results["summary"]
+    logging.info(
+        "汇总: total=%d success=%d failed=%d avg_ratio=%.4f global_ratio=%.4f",
+        summary["total_cases"],
+        summary["success_cases"],
+        summary["failed_cases"],
+        summary["avg_improvement_ratio"],
+        summary["global_improvement_ratio"],
+    )
+    logging.info("全部完成，汇总结果已写入: %s", os.path.abspath(summary_path))
+    if result_json:
+        logging.info("聚合结果 JSON 已写入: %s", os.path.abspath(result_json))
+    return 0
+
+
+def _command_summarize(args: argparse.Namespace) -> int:
+    args.workdir = _resolve_local_path(args.workdir)
+    summarize_results.main(["linucb", "--workdir", str(args.workdir)])
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.command == "run-search":
+        return _command_run_search(args)
+    if args.command == "summarize":
+        return _command_summarize(args)
+    parser.exit(status=2, message="Unknown command.\n")
+    return 2
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

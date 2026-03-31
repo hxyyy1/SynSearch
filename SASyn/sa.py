@@ -32,7 +32,10 @@ def energy_from_counts(
 ) -> float:
     initial_and = max(baseline.initial_and_count, 1)
     initial_lev = max(baseline.initial_lev_count, 1)
-    return (and_weight * (and_count / initial_and)) + (lev_weight * (lev_count / initial_lev))
+    weight_sum = and_weight + lev_weight
+    normalized_and_weight = and_weight / weight_sum
+    normalized_lev_weight = lev_weight / weight_sum
+    return (normalized_and_weight * (and_count / initial_and)) + (normalized_lev_weight * (lev_count / initial_lev))
 
 
 def initial_sequence(config: SearchConfig) -> tuple[str, ...]:

@@ -339,8 +339,12 @@ def _command_summarize(args: argparse.Namespace) -> int:
             handle,
             fieldnames=[
                 "design_name",
-                "cpuct",
-                "search_iterations",
+                "variant_label",
+                # "sequence_length",
+                # "cpuct",
+                # "search_iterations",
+                # "mu_discount",
+                # "seed",
                 "initial_and",
                 "initial_lev",
                 "heuristic_and",
@@ -359,11 +363,22 @@ def _command_summarize(args: argparse.Namespace) -> int:
             assert isinstance(metadata, dict)
             config = metadata["config"]
             assert isinstance(config, dict)
+            variant_label = (
+                f"seq={config['sequence_length']},"
+                f"iters={config['search_iterations']},"
+                f"cpuct={config['cpuct']},"
+                f"mu={config['mu_discount']},"
+                # f"seed={config['seed']}"
+            )
             writer.writerow(
                 {
                     "design_name": row["design_name"],
-                    "cpuct": config["cpuct"],
-                    "search_iterations": config["search_iterations"],
+                    "variant_label": variant_label,
+                    # "sequence_length": config["sequence_length"],
+                    # "cpuct": config["cpuct"],
+                    # "search_iterations": config["search_iterations"],
+                    # "mu_discount": config["mu_discount"],
+                    # "seed": config["seed"],
                     "initial_and": baseline["initial_and"],
                     "initial_lev": baseline["initial_lev"],
                     "heuristic_and": baseline["heuristic_and"],

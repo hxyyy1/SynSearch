@@ -9,9 +9,12 @@
 """
 
 import json
+import argparse
+import csv
 import logging
 import math
 import os
+from pathlib import Path
 import random
 import re
 import subprocess
@@ -21,7 +24,7 @@ from typing import Dict, List, Optional, Tuple
 
 from memory_utils import run_command_with_peak_memory
 
-from . import result_utils
+from . import result_utils, summarize_results
 
 # ------------------------------
 # 1) 动作空间（老虎机摇臂）
@@ -51,6 +54,8 @@ ABC_TIMEOUT_SEC = 30
 # 当节点数异常突增时，给予重罚
 SPIKE_FACTOR = 1.8
 SEVERE_NEGATIVE_REWARD = -1
+AND_REWARD_WEIGHT = 0.5
+LEV_REWARD_WEIGHT = 0.2
 
 # 随机种子（用于并列时随机打破平局）
 RANDOM_SEED = 2
@@ -72,19 +77,36 @@ def natural_sort_key(text: str) -> List[object]:
 
 def parse_optional_kv_args(args: List[str]) -> Dict[str, str]:
     """
-    解析 --key value 形式的可选参数。
+    解析可选参数，支持:
+    - --key value
+    - --flag
     """
+    boolean_flags = {"debug-search", "debug"}
     kv: Dict[str, str] = {}
     i = 0
     while i < len(args):
         token = args[i]
         if not token.startswith("--"):
             raise ValueError(f"无效参数: {token}（可选参数需为 --key value）")
+        key = token[2:]
+        if key in boolean_flags and (i + 1 >= len(args) or args[i + 1].startswith("--")):
+            kv[key] = "true"
+            i += 1
+            continue
         if i + 1 >= len(args):
             raise ValueError(f"参数 {token} 缺少值")
-        kv[token[2:]] = args[i + 1]
+        kv[key] = args[i + 1]
         i += 2
     return kv
+
+
+def parse_bool_flag(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"无法解析布尔值: {value}")
 
 
 # ------------------------------
@@ -182,24 +204,48 @@ def parse_abc_stats(abc_output_string: str) -> Tuple[Optional[int], Optional[int
 def compute_reward(
     old_nodes: int,
     new_nodes: Optional[int],
+    old_level: Optional[int],
+    new_level: Optional[int],
     is_success: bool,
     severe_negative_reward: float = SEVERE_NEGATIVE_REWARD,
     spike_factor: float = SPIKE_FACTOR,
+    and_reward_weight: float = AND_REWARD_WEIGHT,
+    lev_reward_weight: float = LEV_REWARD_WEIGHT,
 ) -> float:
     """
-    - Reward = N_old - N_new
-    - 节点数下降 => 正奖励
-    - 节点数上升 => 负奖励
-    - 失败/解析失败/异常突增 => 严重负奖励
+    Reward = w_and * and_gain + w_lev * lev_gain
     """
-    if (not is_success) or (new_nodes is None):
+    if (not is_success) or (new_nodes is None) or (old_level is None) or (new_level is None):
         return severe_negative_reward
 
     # 异常突增保护：可视为坏动作，给重罚
     if old_nodes > 0 and new_nodes > int(old_nodes * spike_factor):
         return severe_negative_reward
 
-    return float((old_nodes - new_nodes)/old_nodes)
+    weight_sum = and_reward_weight + lev_reward_weight
+    if weight_sum <= 0:
+        raise ValueError("and_reward_weight + lev_reward_weight must be positive")
+
+    normalized_and_weight = and_reward_weight / weight_sum
+    normalized_lev_weight = lev_reward_weight / weight_sum
+    and_gain = float(old_nodes - new_nodes) / max(old_nodes, 1)
+    lev_gain = float(old_level - new_level) / max(old_level, 1)
+    return (normalized_and_weight * and_gain) + (normalized_lev_weight * lev_gain)
+
+
+def is_better_result(
+    candidate_nodes: int,
+    candidate_level: Optional[int],
+    incumbent_nodes: int,
+    incumbent_level: Optional[int],
+) -> bool:
+    if candidate_nodes != incumbent_nodes:
+        return candidate_nodes < incumbent_nodes
+    if candidate_level is None:
+        return False
+    if incumbent_level is None:
+        return True
+    return candidate_level < incumbent_level
 
 
 # ------------------------------
@@ -251,6 +297,35 @@ class UCBBandit:
 
             # Q_n = Q_{n-1} + (R - Q_{n-1}) / n
             self.q_values[action_index] = q + (reward - q) / n
+            # self.q_values[action_index] = q + (reward - q) * 0.1
+
+
+def snapshot_action_state(bandit: UCBBandit) -> List[Dict[str, object]]:
+    t = max(1, bandit.total_steps)
+    rows: List[Dict[str, object]] = []
+    for action_index, action_name in enumerate(bandit.actions):
+        count_before = bandit.counts[action_index]
+        q_before = bandit.q_values[action_index]
+        if count_before == 0:
+            bonus_before = None
+            score_before = None
+            cold_start = True
+        else:
+            bonus_before = bandit.c * math.sqrt(math.log(t) / count_before)
+            score_before = q_before + bonus_before
+            cold_start = False
+        rows.append(
+            {
+                "action_index": action_index,
+                "action": action_name,
+                "count_before": count_before,
+                "q_before": q_before,
+                "bonus_before": bonus_before,
+                "score_before": score_before,
+                "cold_start": cold_start,
+            }
+        )
+    return rows
 
 
 # ------------------------------
@@ -302,6 +377,7 @@ def optimize_one_benchmark(
     benchmark_name: Optional[str] = None,
     bandit_c: float = 2.0,
     abc_bin: Optional[str] = None,
+    debug_search: bool = False,
 ) -> Dict:
     """
     对单个电路做 MAB 优化。
@@ -347,6 +423,7 @@ def optimize_one_benchmark(
     best_recipe: List[str] = []
 
     episode_best_trace = []
+    debug_trace: List[Dict[str, object]] = []
 
     for ep in range(1, N_EPISODES + 1):
         current_nodes = init_nodes
@@ -355,6 +432,7 @@ def optimize_one_benchmark(
         current_idx: List[int] = []
 
         for step in range(1, K_STEPS + 1):
+            action_state_rows = snapshot_action_state(bandit) if debug_search else []
             action_idx = bandit.select_action()
             action_cmd = actions[action_idx]
 
@@ -362,6 +440,25 @@ def optimize_one_benchmark(
             current_idx += [action_idx]      # 序列里动作对应的 index
             bandit.total_steps += 1
             bandit.counts[action_idx] += 1
+            if debug_search:
+                sequence_prefix = "; ".join(current_seq)
+                for action_state in action_state_rows:
+                    debug_trace.append(
+                        {
+                            "episode": ep,
+                            "step": step,
+                            "action_index": action_state["action_index"],
+                            "action": action_state["action"],
+                            "selected": int(action_state["action_index"] == action_idx),
+                            "count_before": action_state["count_before"],
+                            "q_before": action_state["q_before"],
+                            "bonus_before": action_state["bonus_before"],
+                            "score_before": action_state["score_before"],
+                            "cold_start": int(bool(action_state["cold_start"])),
+                            "count_after_select": bandit.counts[int(action_state["action_index"])],
+                            "sequence_prefix": sequence_prefix,
+                        }
+                    )
 
         success, new_nodes, new_level, output, eval_peak_memory_kb = evaluate_sequence(
             blif_path,
@@ -371,8 +468,30 @@ def optimize_one_benchmark(
         if eval_peak_memory_kb is not None and (peak_memory_kb is None or eval_peak_memory_kb > peak_memory_kb):
             peak_memory_kb = eval_peak_memory_kb
 
-        reward = compute_reward(current_nodes, new_nodes, success)
+        reward = compute_reward(
+            current_nodes,
+            new_nodes,
+            current_level,
+            new_level,
+            success,
+            and_reward_weight=AND_REWARD_WEIGHT,
+            lev_reward_weight=LEV_REWARD_WEIGHT,
+        )
         bandit.update(current_idx, reward)
+        if debug_search:
+            episode_sequence = "; ".join(current_seq)
+            for row in debug_trace[-(len(actions) * K_STEPS):]:
+                if int(row["episode"]) != ep:
+                    continue
+                action_index = int(row["action_index"])
+                row["count_after_update"] = bandit.counts[action_index]
+                row["q_after_update"] = bandit.q_values[action_index]
+                row["episode_reward"] = reward
+                row["episode_success"] = int(success)
+                row["episode_nodes"] = new_nodes
+                row["episode_level"] = new_level
+                row["episode_peak_memory_kb"] = eval_peak_memory_kb
+                row["episode_sequence"] = episode_sequence
 
         # 若命令失败或统计异常，不推进序列状态（但该动作仍受惩罚）
         if (not success) or (new_nodes is None):
@@ -408,7 +527,7 @@ def optimize_one_benchmark(
         # logging.info(bandit.q_values)
 
         # 更新全局最优
-        if current_nodes < best_nodes:
+        if is_better_result(current_nodes, current_level, best_nodes, best_level):
             best_nodes = current_nodes
             best_level = current_level
             best_recipe = list(current_seq)
@@ -424,6 +543,12 @@ def optimize_one_benchmark(
         # logging.info(current_seq)
 
         episode_best_trace.append(best_nodes)
+        if debug_search:
+            for row in debug_trace[-(len(actions) * K_STEPS):]:
+                if int(row["episode"]) != ep:
+                    continue
+                row["best_nodes_after_episode"] = best_nodes
+                row["best_level_after_episode"] = best_level
         logging.info(
             "[%s] Episode %d/%d 完成, 当前全局最优 and=%d lev=%d",
             benchmark_name,
@@ -461,11 +586,14 @@ def optimize_one_benchmark(
             # "spike_factor": SPIKE_FACTOR,
             # "severe_negative_reward": SEVERE_NEGATIVE_REWARD,
             "ucb_c": bandit_c,
+            "and_reward_weight": AND_REWARD_WEIGHT,
+            "lev_reward_weight": LEV_REWARD_WEIGHT,
+            "debug_search": debug_search,
             "seed": RANDOM_SEED,
         },
         "runtime_sec": time.perf_counter() - started,
         "peak_memory_kb": peak_memory_kb,
-        # "episode_best_trace": episode_best_trace,
+        "debug_trace": debug_trace if debug_search else [],
         "bandit": {
             # "actions": actions,
             # "counts": bandit.counts,
@@ -511,9 +639,121 @@ def write_result_artifacts(
     aggregate_payload: Optional[Dict] = None,
 ) -> str:
     result_path = result_utils.write_benchmark_result(method_name, result)
+    _write_debug_trace_csv(method_name, result)
+    _write_debug_trace_json(method_name, result)
     if aggregate_payload is not None:
         result_utils.write_method_summary(method_name, aggregate_payload)
     return result_path
+
+
+def _write_debug_trace_csv(method_name: str, result: Dict) -> str | None:
+    debug_rows = result.get("debug_trace")
+    if not isinstance(debug_rows, list) or not debug_rows:
+        return None
+    benchmark_name = str(result.get("benchmark", "unknown"))
+    output_path = _debug_trace_csv_path(method_name, benchmark_name)
+    fieldnames = list(debug_rows[0].keys())
+    with open(output_path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in debug_rows:
+            writer.writerow(row)
+    return output_path
+
+
+def _write_debug_trace_json(method_name: str, result: Dict) -> str | None:
+    debug_rows = result.get("debug_trace")
+    if not isinstance(debug_rows, list) or not debug_rows:
+        return None
+    benchmark_name = str(result.get("benchmark", "unknown"))
+    output_path = _debug_trace_json_path(method_name, benchmark_name)
+    with open(output_path, "w", encoding="utf-8") as handle:
+        json.dump(_build_debug_episode_payload(result, debug_rows), handle, indent=2, ensure_ascii=False)
+    return output_path
+
+
+def _debug_trace_csv_path(method_name: str, benchmark_name: str) -> str:
+    result_dir = result_utils.get_method_results_dir(method_name)
+    filename = result_utils.benchmark_to_result_filename(benchmark_name).removesuffix(".json") + ".debug.csv"
+    return os.path.join(result_dir, filename)
+
+
+def _debug_trace_json_path(method_name: str, benchmark_name: str) -> str:
+    result_dir = result_utils.get_method_results_dir(method_name)
+    filename = result_utils.benchmark_to_result_filename(benchmark_name).removesuffix(".json") + ".debug.json"
+    return os.path.join(result_dir, filename)
+
+
+def _build_debug_episode_payload(result: Dict, debug_rows: List[Dict[str, object]]) -> Dict[str, object]:
+    config = result.get("config", {})
+    if not isinstance(config, dict):
+        config = {}
+
+    episodes: List[Dict[str, object]] = []
+    rows_by_episode: Dict[int, List[Dict[str, object]]] = {}
+    for row in debug_rows:
+        episode = int(row["episode"])
+        rows_by_episode.setdefault(episode, []).append(row)
+
+    for episode in sorted(rows_by_episode):
+        episode_rows = rows_by_episode[episode]
+        rows_by_step: Dict[int, List[Dict[str, object]]] = {}
+        for row in episode_rows:
+            step = int(row["step"])
+            rows_by_step.setdefault(step, []).append(row)
+
+        first_row = episode_rows[0]
+        steps_payload: List[Dict[str, object]] = []
+        for step in sorted(rows_by_step):
+            step_rows = rows_by_step[step]
+            selected_row = next((row for row in step_rows if int(row["selected"]) == 1), step_rows[0])
+            actions_payload = [
+                {
+                    "action": row["action"],
+                    "selected": bool(int(row["selected"])),
+                    "count_before": row["count_before"],
+                    "q_before": row["q_before"],
+                    "bonus_before": row["bonus_before"],
+                    "score_before": row["score_before"],
+                    "count_after_update": row.get("count_after_update"),
+                    "q_after_update": row.get("q_after_update"),
+                }
+                for row in sorted(step_rows, key=lambda item: int(item["action_index"]))
+            ]
+            steps_payload.append(
+                {
+                    "step": step,
+                    "selected_action": selected_row["action"],
+                    "actions": actions_payload,
+                }
+            )
+
+        episodes.append(
+            {
+                "episode": episode,
+                "reward": first_row.get("episode_reward"),
+                "success": bool(int(first_row.get("episode_success", 0))),
+                "nodes": first_row.get("episode_nodes"),
+                "level": first_row.get("episode_level"),
+                "best_nodes": first_row.get("best_nodes_after_episode"),
+                "best_level": first_row.get("best_level_after_episode"),
+                "sequence": first_row.get("episode_sequence"),
+                "steps": steps_payload,
+            }
+        )
+
+    return {
+        "benchmark": result.get("benchmark"),
+        "config": {
+            "episodes": config.get("episodes"),
+            "steps_per_episode": config.get("steps_per_episode"),
+            "ucb_c": config.get("ucb_c"),
+            "and_reward_weight": config.get("and_reward_weight"),
+            "lev_reward_weight": config.get("lev_reward_weight"),
+            "seed": config.get("seed"),
+        },
+        "episodes": episodes,
+    }
 
 
 def setup_logging() -> None:
@@ -525,71 +765,151 @@ def setup_logging() -> None:
     )
 
 
-def main() -> None:
+def _resolve_local_path(path: Path) -> Path:
+    cwd = Path.cwd().resolve()
+    candidate = (cwd / path).resolve() if not path.is_absolute() else path.resolve()
+    if not candidate.is_relative_to(cwd):
+        raise SystemExit(f"Path '{path}' must stay under the current working directory: {cwd}")
+    return candidate
+
+
+def _discover_designs_or_exit(dataset_root: Path) -> dict[str, str]:
+    files = find_blif_files(str(dataset_root))
+    if not files:
+        raise SystemExit(f"未找到 .blif 文件，请检查目录: {dataset_root}")
+    return {
+        os.path.relpath(os.path.abspath(blif_path), str(dataset_root.resolve())).replace("\\", "/"): blif_path
+        for blif_path in files
+    }
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="baseline_mab")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    run = subparsers.add_parser("run-search", help="Run baseline MAB search.")
+    run.add_argument("--workdir", type=Path, default=Path(result_utils.DEFAULT_WORKDIR_NAME))
+    run.add_argument("--abc-bin", default=ABC_BIN)
+    run.add_argument("--dataset-root", type=Path, default=Path("tc_public"))
+    run.add_argument("--design", help="Single .blif filename under dataset-root. Default: run all.")
+    run.add_argument("--steps", type=int, default=K_STEPS)
+    run.add_argument("--episodes", type=int, default=N_EPISODES)
+    run.add_argument("--timeout", type=int, default=ABC_TIMEOUT_SEC)
+    run.add_argument("--spike-factor", type=float, default=SPIKE_FACTOR)
+    run.add_argument("--severe-negative-reward", type=float, default=SEVERE_NEGATIVE_REWARD)
+    run.add_argument("--and-weight", type=float, default=AND_REWARD_WEIGHT)
+    run.add_argument("--lev-weight", type=float, default=LEV_REWARD_WEIGHT)
+    run.add_argument("--ucb-c", type=float, default=2.0)
+    run.add_argument("--seed", type=int, default=RANDOM_SEED)
+    run.add_argument("--actions", default=None)
+    run.add_argument("--result-json", type=Path, default=None)
+    run.add_argument("--log-level", default="INFO")
+    run.add_argument("--debug-search", action="store_true")
+
+    summarize = subparsers.add_parser("summarize", help="Aggregate JSON search results into CSV.")
+    summarize.add_argument("--workdir", type=Path, default=Path(result_utils.DEFAULT_WORKDIR_NAME))
+    return parser
+
+
+def _configure_runtime_from_args(args: argparse.Namespace) -> None:
     global K_STEPS, N_EPISODES, ABC_TIMEOUT_SEC, SPIKE_FACTOR
-    global SEVERE_NEGATIVE_REWARD, RANDOM_SEED
+    global SEVERE_NEGATIVE_REWARD, RANDOM_SEED, AND_REWARD_WEIGHT, LEV_REWARD_WEIGHT
+    K_STEPS = args.steps
+    N_EPISODES = args.episodes
+    ABC_TIMEOUT_SEC = args.timeout
+    SPIKE_FACTOR = args.spike_factor
+    SEVERE_NEGATIVE_REWARD = args.severe_negative_reward
+    AND_REWARD_WEIGHT = args.and_weight
+    LEV_REWARD_WEIGHT = args.lev_weight
+    RANDOM_SEED = args.seed
+    if args.actions:
+        parsed_actions = [x.strip() for x in args.actions.split(",") if x.strip()]
+        if parsed_actions:
+            actions[:] = parsed_actions
 
-    # 单电路模式：python baseline_mab.py <design> [--key value...]
-    if len(sys.argv) >= 2 and not sys.argv[1].startswith("--"):
-        design = sys.argv[1]
-        kv = parse_optional_kv_args(sys.argv[2:])
 
-        abc_bin = kv.get("abc-bin", ABC_BIN)
-        workdir = kv.get("workdir", result_utils.DEFAULT_WORKDIR_NAME)
-        result_utils.set_workdir(workdir)
-        result_json = result_utils.optional_output_path(
-            kv,
-            "result-json",
-        )
-        ucb_c = float(kv.get("ucb-c", "2.0"))
-        log_level = kv.get("log-level", "INFO").upper()
-
-        K_STEPS = int(kv.get("steps", str(K_STEPS)))
-        N_EPISODES = int(kv.get("episodes", str(N_EPISODES)))
-        ABC_TIMEOUT_SEC = int(kv.get("timeout", str(ABC_TIMEOUT_SEC)))
-        SPIKE_FACTOR = float(kv.get("spike-factor", str(SPIKE_FACTOR)))
-        SEVERE_NEGATIVE_REWARD = float(
-            kv.get("severe-negative-reward", str(SEVERE_NEGATIVE_REWARD))
-        )
-        RANDOM_SEED = int(kv.get("seed", str(RANDOM_SEED)))
-
-        if "actions" in kv:
-            parsed_actions = [x.strip() for x in kv["actions"].split(",") if x.strip()]
-            if parsed_actions:
-                actions[:] = parsed_actions
-
-        setup_logging()
-        logging.getLogger().setLevel(getattr(logging, log_level, logging.INFO))
-
-        if not os.path.isfile(design):
-            logging.error("design 文件不存在: %s", design)
-            return
-
-        logging.info("单电路模式: design=%s", os.path.abspath(design))
-        logging.info(
-            "参数: steps=%d episodes=%d timeout=%d ucb_c=%.3f",
-            K_STEPS,
-            N_EPISODES,
-            ABC_TIMEOUT_SEC,
-            ucb_c,
-        )
-
-        result = optimize_one_benchmark(design, bandit_c=ucb_c, abc_bin=abc_bin)
-        result["meta"] = {
-            "mode": "single_design",
-            "abc_bin": abc_bin,
-        }
-
-        result_path = write_result_artifacts(result)
-        if result_json:
-            with open(result_json, "w", encoding="utf-8") as f:
-                json.dump(result, f, indent=2, ensure_ascii=False)
-        logging.info("完成，结果已写入: %s", os.path.abspath(result_path))
-        return
+def _command_run_search(args: argparse.Namespace) -> int:
+    args.workdir = _resolve_local_path(args.workdir)
+    result_utils.set_workdir(str(args.workdir))
+    result_json = _resolve_local_path(args.result_json) if args.result_json else None
+    _configure_runtime_from_args(args)
 
     setup_logging()
-    logging.error("批量模式已拆分，请使用 baseline_mab_batch.py")
+    logging.getLogger().setLevel(getattr(logging, args.log_level.upper(), logging.INFO))
+    logging.info("ABC二进制: %s", args.abc_bin)
+    logging.info("Benchmark目录: %s", os.path.abspath(args.dataset_root))
+
+    designs = _discover_designs_or_exit(args.dataset_root)
+    if args.design:
+        if args.design not in designs:
+            available = ", ".join(sorted(designs))
+            raise SystemExit(f"Unknown design '{args.design}'. Available designs: {available}")
+        selected = {args.design: designs[args.design]}
+    else:
+        selected = designs
+
+    all_results = {
+        "meta": {
+            "abc_bin": args.abc_bin,
+            "benchmark_dir": os.path.abspath(args.dataset_root),
+            "num_benchmarks": len(selected),
+        },
+        "results": [],
+    }
+
+    for design_name, design_path in selected.items():
+        result = optimize_one_benchmark(
+            design_path,
+            benchmark_name=design_name,
+            bandit_c=args.ucb_c,
+            abc_bin=args.abc_bin,
+            debug_search=args.debug_search,
+        )
+        result["meta"] = {
+            "mode": "single_design" if args.design else "batch",
+            "abc_bin": args.abc_bin,
+        }
+        all_results["results"].append(result)
+        result_path = write_result_artifacts(result)
+        logging.info("完成: %s -> %s", design_name, os.path.abspath(result_path))
+
+    all_results["summary"] = build_summary(all_results["results"])
+    summary_path = result_utils.write_method_summary("baseline_mab", all_results)
+    if result_json:
+        with open(result_json, "w", encoding="utf-8") as f:
+            json.dump(all_results, f, indent=2, ensure_ascii=False)
+
+    summary = all_results["summary"]
+    logging.info(
+        "汇总: total=%d success=%d failed=%d avg_ratio=%.4f global_ratio=%.4f",
+        summary["total_cases"],
+        summary["success_cases"],
+        summary["failed_cases"],
+        summary["avg_improvement_ratio"],
+        summary["global_improvement_ratio"],
+    )
+    logging.info("全部完成，汇总结果已写入: %s", os.path.abspath(summary_path))
+    if result_json:
+        logging.info("聚合结果 JSON 已写入: %s", os.path.abspath(result_json))
+    return 0
+
+
+def _command_summarize(args: argparse.Namespace) -> int:
+    args.workdir = _resolve_local_path(args.workdir)
+    summarize_results.main(["baseline_mab", "--workdir", str(args.workdir)])
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.command == "run-search":
+        return _command_run_search(args)
+    if args.command == "summarize":
+        return _command_summarize(args)
+    parser.exit(status=2, message="Unknown command.\n")
+    return 2
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

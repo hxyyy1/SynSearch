@@ -36,6 +36,7 @@ class LoadedSummary:
     design_column: str
     metric_columns: dict[str, str]
     rows: dict[str, dict[str, float | None]]
+    variant_label: str | None
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -147,10 +148,14 @@ def load_summary(spec: SummarySpec) -> LoadedSummary:
             )
 
         rows: dict[str, dict[str, float | None]] = {}
+        variant_labels: set[str] = set()
         for raw_row in reader:
             design_name = (raw_row.get(design_column) or "").strip()
             if not design_name:
                 continue
+            variant_label = (raw_row.get("variant_label") or "").strip()
+            if variant_label:
+                variant_labels.add(variant_label)
             metrics: dict[str, float | None] = {}
             for metric_name, column_name in metric_columns.items():
                 raw_value = (raw_row.get(column_name) or "").strip()
@@ -162,12 +167,17 @@ def load_summary(spec: SummarySpec) -> LoadedSummary:
 
     if not rows:
         raise SystemExit(f"Summary {path} does not contain any usable rows.")
+    if len(variant_labels) > 1:
+        raise SystemExit(
+            f"Summary {path} contains multiple variant_label values; please split different parameter runs into separate summaries."
+        )
 
     return LoadedSummary(
         spec=SummarySpec(spec.name, path),
         design_column=design_column,
         metric_columns=metric_columns,
         rows=rows,
+        variant_label=next(iter(variant_labels)) if variant_labels else None,
     )
 
 
@@ -312,6 +322,7 @@ def compare_summaries(
             )
             detail_row: dict[str, object] = {
                 "algorithm": summary.spec.name,
+                "variant_label": summary.variant_label,
                 "design": design_name,
                 "weighted_cost": weighted_cost,
                 "final_score": final_score,
@@ -329,6 +340,7 @@ def compare_summaries(
             continue
         row: dict[str, object] = {
             "algorithm": summary.spec.name,
+            "variant_label": summary.variant_label,
             "design_count": len(algorithm_scores),
             "weighted_cost": sum(item["weighted_cost"] for item in algorithm_scores) / len(algorithm_scores),
             "final_score": sum(item["final_score"] for item in algorithm_scores) / len(algorithm_scores),
@@ -346,9 +358,16 @@ def compare_summaries(
             -float(row["final_score"]),
             float(row["weighted_cost"]),
             _natural_key(str(row["algorithm"])),
+            _natural_key(str(row.get("variant_label") or "")),
         )
     )
-    detail_rows.sort(key=lambda row: (_natural_key(str(row["design"])), _natural_key(str(row["algorithm"]))))
+    detail_rows.sort(
+        key=lambda row: (
+            _natural_key(str(row["design"])),
+            _natural_key(str(row["algorithm"])),
+            _natural_key(str(row.get("variant_label") or "")),
+        )
+    )
     return aggregate_rows, detail_rows, designs, metrics, active_weight_sum
 
 
@@ -388,7 +407,7 @@ def _print_report(
             f"(active weight sum = {active_weight_sum:.3f})."
         )
 
-    aggregate_headers = ["rank", "algorithm", "designs", "weighted_cost", "final_score"]
+    aggregate_headers = ["rank", "algorithm", "variant_label", "designs", "weighted_cost", "final_score"]
     for metric_name in metrics:
         aggregate_headers.append(f"avg_{metric_name}")
         aggregate_headers.append(f"avg_norm_{metric_name}")
@@ -397,6 +416,7 @@ def _print_report(
         cells = [
             str(rank),
             str(row["algorithm"]),
+            str(row.get("variant_label") or "-"),
             str(row["design_count"]),
             f"{float(row['weighted_cost']):.6f}",
             f"{float(row['final_score']):.4f}",
@@ -408,7 +428,7 @@ def _print_report(
     print()
     print(_format_table(aggregate_headers, aggregate_rows_text))
 
-    detail_headers = ["design", "algorithm", "weighted_cost", "final_score", "active_weight_sum"]
+    detail_headers = ["design", "algorithm", "variant_label", "weighted_cost", "final_score", "active_weight_sum"]
     for metric_name in metrics:
         detail_headers.extend((metric_name, f"max_{metric_name}", f"norm_{metric_name}"))
     detail_rows_text: list[list[str]] = []
@@ -416,6 +436,7 @@ def _print_report(
         cells = [
             str(row["design"]),
             str(row["algorithm"]),
+            str(row.get("variant_label") or "-"),
             f"{float(row['weighted_cost']):.6f}",
             f"{float(row['final_score']):.4f}",
             f"{float(row['active_weight_sum']):.3f}",

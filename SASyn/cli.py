@@ -198,7 +198,14 @@ def _command_summarize(args: argparse.Namespace) -> int:
             handle,
             fieldnames=[
                 "design_name",
-                "search_iterations",
+                "variant_label",
+                # "sequence_length",
+                # "search_iterations",
+                # "and_weight",
+                # "lev_weight",
+                # "initial_temperature",
+                # "min_temperature",
+                # "seed",
                 "initial_and",
                 "initial_lev",
                 "heuristic_and",
@@ -217,10 +224,25 @@ def _command_summarize(args: argparse.Namespace) -> int:
             assert isinstance(metadata, dict)
             config = metadata["config"]
             assert isinstance(config, dict)
+            variant_label = (
+                f"seq={config['sequence_length']},"
+                f"iters={config['search_iterations']},"
+                # f"and_w={config['and_weight']},"
+                # f"lev_w={config['lev_weight']},"
+                f"min_temp={config['min_temperature']},"
+                f"seed={config['seed']}"
+            )
             writer.writerow(
                 {
                     "design_name": row["design_name"],
-                    "search_iterations": config["search_iterations"],
+                    "variant_label": variant_label,
+                    # "sequence_length": config["sequence_length"],
+                    # "search_iterations": config["search_iterations"],
+                    # "and_weight": config["and_weight"],
+                    # "lev_weight": config["lev_weight"],
+                    # "initial_temperature": config["initial_temperature"],
+                    # "min_temperature": config["min_temperature"],
+                    # "seed": config["seed"],
                     "initial_and": baseline["initial_and"],
                     "initial_lev": baseline["initial_lev"],
                     "heuristic_and": baseline["heuristic_and"],

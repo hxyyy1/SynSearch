@@ -35,8 +35,8 @@ class BackendError(RuntimeError):
     """Raised when the ABC backend fails."""
 
 
-AND_REWARD_WEIGHT = 0.7
-LEV_REWARD_WEIGHT = 0.3
+AND_REWARD_WEIGHT = 0.5
+LEV_REWARD_WEIGHT = 0.2
 
 
 def parse_abc_and_count(output: str) -> int:
@@ -77,7 +77,10 @@ def immediate_reward(
     and_reward = _signed_sqrt_reward(previous_and_count, current_and_count, and_baseline)
     lev_reward = _signed_sqrt_reward(previous_lev_count, current_lev_count, lev_baseline)
     # Keep the total reward in the same range as the current sqrt-normalized reward.
-    return (AND_REWARD_WEIGHT * and_reward) + (LEV_REWARD_WEIGHT * lev_reward)
+    weight_sum = AND_REWARD_WEIGHT + LEV_REWARD_WEIGHT
+    and_weight = AND_REWARD_WEIGHT / weight_sum
+    lev_weight = LEV_REWARD_WEIGHT / weight_sum
+    return (and_weight * and_reward) + (lev_weight * lev_reward)
 
 
 class ABCBackend:

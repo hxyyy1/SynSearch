@@ -130,38 +130,38 @@ Each SA result JSON includes the final sequence as an `ABC` command string, fina
 - `baseline_mab`: UCB1 sequence search
 - `linucb`: contextual bandit search with LinUCB
 
-Both are now invoked as modules and store generated files under `.mabsyn_work/` by default.
+Both are now invoked with subcommands and store generated files under `.mabsyn_work/` by default.
 
-Single-design commands:
-
-```bash
-python -m MABSyn.baseline_mab tc_public/tc_public_1/input.blif --episodes 20 --steps 10 --ucb-c 1.5
-python -m MABSyn.linucb tc_public/tc_public_1/input.blif --episodes 20 --steps 10
-```
-
-Batch commands:
+Run search:
 
 ```bash
-python -m MABSyn.baseline_mab_batch --episodes 20 --steps 10
-python -m MABSyn.linucb_batch --episodes 20 --steps 10
+python -m MABSyn.baseline_mab run-search --dataset-root tc_public --design tc_public_1/input.blif --episodes 20 --steps 10 --ucb-c 1.5 --debug-search
+python -m MABSyn.baseline_mab run-search --dataset-root benchmarks/VTR --design bfly.abc.blif --episodes 20 --steps 10
+python -m MABSyn.baseline_mab run-search --dataset-root tc_public --episodes 20 --steps 10
+python -m MABSyn.linucb run-search --dataset-root tc_public --design tc_public_1/input.blif --episodes 20 --steps 10
+python -m MABSyn.linucb run-search --dataset-root benchmarks/VTR --design bfly.abc.blif --episodes 20 --steps 10
+python -m MABSyn.linucb run-search --dataset-root tc_public --episodes 20 --steps 10
 ```
 
 Summaries:
 
 ```bash
-python -m MABSyn.summarize_results baseline_mab
-python -m MABSyn.summarize_results linucb
+python -m MABSyn.baseline_mab summarize
+python -m MABSyn.linucb summarize
 ```
 
 Common parameters:
 
 - `--workdir .mabsyn_work`: root directory for result JSON, summaries, and caches
 - `--abc-bin`: explicit `ABC` path
+- `--dataset-root`: root directory containing `.blif` files
+- `--design`: run one exact design under the dataset root; omit it to run all discovered designs
 - `--steps`: fixed sequence length or steps per episode
 - `--episodes`: total episodes / iterations used by the method
 - `--seed`: random seed
 - `--actions`: comma-separated action override
 - `--result-json`: optional explicit aggregate output path
+- `--debug-search`: enable detailed per-episode debug artifacts for `baseline_mab`
 
 Method-specific parameters remain unchanged, including `--ucb-c` for `baseline_mab` and `--alpha`, `--linucb-alpha`, `--lambda`, `--linucb-lambda`, `--long-term-rollouts`, and `--long-term-horizon` for `linucb`.
 
@@ -170,6 +170,7 @@ Outputs:
 - Default root is `.mabsyn_work/`
 - `baseline_mab` and `linucb` no longer write default aggregate `*_results.json` files; pass `--result-json` if you want one
 - Per-benchmark results are stored under `.mabsyn_work/results/baseline_mab/` and `.mabsyn_work/results/linucb/`
+- `baseline_mab` writes `.debug.csv` and `.debug.json` beside the result JSON when `--debug-search` is enabled
 - Summary CSV is written under `.mabsyn_work/results/summary.csv` or per-method summary paths
 - LinUCB cache files are written under `.mabsyn_work/cache/linucb/`
 

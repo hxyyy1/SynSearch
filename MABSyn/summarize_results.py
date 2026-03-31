@@ -46,15 +46,27 @@ def main(argv: list[str] | None = None) -> None:
     result_utils.ensure_dir(result_path)
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(("file", "and", "lev", "runtime_sec", "peak_memory_kb"))
+        writer.writerow(
+            (
+                "file",
+                "method",
+                "variant_label",
+                # "steps",
+                # "iterations",
+                # "seed",
+                # "ucb_c",
+                # "alpha",
+                # "lambda",
+                # "and_reward_weight",
+                # "lev_reward_weight",
+                "and",
+                "lev",
+                "runtime_sec",
+                "peak_memory_kb",
+            )
+        )
         writer.writerows(table_rows)
-    # print(
-    #     result_utils.format_table(
-    #         headers=("file", "and", "lev", "runtime_sec"),
-    #         rows=table_rows,
-    #     )
-    # )
-    print(f"\nCSV written to: {csv_path}")
+    print(csv_path)
 
 
 if __name__ == "__main__":
