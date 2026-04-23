@@ -11,8 +11,6 @@ import uuid
 import math
 from pathlib import Path
 
-from memory_utils import run_command_with_peak_memory
-
 from .types import (
     ACTION_TO_ABC_COMMAND,
     BackendResult,
@@ -92,7 +90,6 @@ class ABCBackend:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.abc_bin = abc_bin or self._discover_abc()
         self._version: str | None = None
-        self._peak_memory_kb: float | None = None
 
     def _discover_abc(self) -> str:
         for candidate in ("abc", "yosys-abc", "berkeley-abc"):
@@ -109,21 +106,16 @@ class ABCBackend:
         return self._version
 
     def get_peak_memory_kb(self) -> float | None:
-        return self._peak_memory_kb
-
-    def _observe_peak_memory_kb(self, peak_memory_kb: float | None) -> None:
-        if peak_memory_kb is None:
-            return
-        if self._peak_memory_kb is None or peak_memory_kb > self._peak_memory_kb:
-            self._peak_memory_kb = peak_memory_kb
+        return None
 
     def _probe_version(self) -> str:
         commands = ("version", "print_stats", "help")
         for command in commands:
             try:
-                completed, _ = run_command_with_peak_memory(
+                completed = subprocess.run(
                     [self.abc_bin, "-c", command],
                     check=True,
+                    capture_output=True,
                     text=True,
                 )
             except (OSError, subprocess.CalledProcessError):
@@ -208,9 +200,10 @@ class ABCBackend:
         )
         started = time.perf_counter()
         try:
-            completed, peak_memory_kb = run_command_with_peak_memory(
+            completed = subprocess.run(
                 [self.abc_bin, "-c", command_string],
                 check=True,
+                capture_output=True,
                 text=True,
             )
         except OSError as exc:
@@ -223,7 +216,6 @@ class ABCBackend:
                 f"Output:\n{payload.strip()}"
             ) from exc
         runtime_sec = time.perf_counter() - started
-        self._observe_peak_memory_kb(peak_memory_kb)
         payload = (completed.stdout + "\n" + completed.stderr).strip()
         and_count, lev_count = parse_abc_stats(payload)
         result = BackendResult(
@@ -233,7 +225,7 @@ class ABCBackend:
             snapshot_path=snapshot_path,
             log=payload,
             cache_hit=False,
-            peak_memory_kb=peak_memory_kb,
+            peak_memory_kb=None,
         )
         self._store_cached_result(key, result)
         return result
@@ -270,7 +262,6 @@ class ABCBackend:
             cache_hit=True,
             peak_memory_kb=float(payload["peak_memory_kb"]) if payload.get("peak_memory_kb") is not None else None,
         )
-        self._observe_peak_memory_kb(result.peak_memory_kb)
         return result
 
     def _store_cached_result(self, key: str, result: BackendResult) -> None:

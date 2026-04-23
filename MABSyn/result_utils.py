@@ -176,20 +176,13 @@ def extract_table_rows(rows: Sequence[Dict]) -> List[List[str]]:
         variant_parts = [f"steps={steps}", f"iters={iterations}"]
         if ucb_c != "-":
             variant_parts.append(f"ucb_c={ucb_c}")
-        # if alpha != "-":
-        #     variant_parts.append(f"alpha={alpha}")
-        # if reg_lambda != "-":
-        #     variant_parts.append(f"lambda={reg_lambda}")
-        # if and_reward_weight != "-":
-        #     variant_parts.append(f"and_w={and_reward_weight}")
-        # if lev_reward_weight != "-":
-        #     variant_parts.append(f"lev_w={lev_reward_weight}")
         if seed != "-":
             variant_parts.append(f"seed={seed}")
         variant_label = ",".join(variant_parts)
         table_rows.append(
             [
                 str(payload.get("benchmark", row["result_file"])),
+                # str(row["method"]),
                 variant_label,
                 # str(steps),
                 # str(iterations),

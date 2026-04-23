@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from SASyn.core_types import BaselineInfo, BackendResult, SearchConfig
@@ -156,6 +157,16 @@ class SASynCoreTests(unittest.TestCase):
 
 
 class SASynCLITests(unittest.TestCase):
+    def test_run_search_parser_exposes_external_monitor_flag(self) -> None:
+        from SASyn import cli as sasyn_cli
+
+        parser = sasyn_cli._build_parser()
+        default_args = parser.parse_args(["run-search"])
+        enabled_args = parser.parse_args(["run-search", "--external-monitor"])
+
+        self.assertFalse(default_args.external_monitor)
+        self.assertTrue(enabled_args.external_monitor)
+
     def test_help_commands(self) -> None:
         commands = [
             [],
@@ -174,3 +185,59 @@ class SASynCLITests(unittest.TestCase):
                 self.assertEqual(completed.returncode, 0, completed.stderr)
                 self.assertIn("usage:", completed.stdout.lower())
                 self.assertIn("sasyn", completed.stdout.lower())
+
+    def test_run_search_cleans_up_base_aig_directory(self) -> None:
+        from SASyn import cli as sasyn_cli
+
+        workdir = REPO_ROOT / ".test_artifacts" / self._testMethodName
+        if workdir.exists():
+            shutil.rmtree(workdir)
+        workdir.mkdir(parents=True, exist_ok=True)
+        try:
+            design_path = workdir / "dataset" / "input.blif"
+            design_path.parent.mkdir(parents=True, exist_ok=True)
+            design_path.write_text(".model toy\n.end\n", encoding="ascii")
+
+            class FakeCLIBackend:
+                def __init__(self, abc_bin: str | None, workdir: Path) -> None:
+                    del abc_bin
+                    self.base_aig_dir = workdir / "base_aig"
+                    self.base_aig_dir.mkdir(parents=True, exist_ok=True)
+                    (self.base_aig_dir / "temp.aig").write_text("temp", encoding="ascii")
+
+                def cleanup_base_aig(self) -> None:
+                    if self.base_aig_dir.exists():
+                        shutil.rmtree(self.base_aig_dir, ignore_errors=True)
+
+            class FakeSearchResult:
+                final_and_count = 10
+                final_lev_count = 2
+                sequence = ("balance",)
+
+                def to_json_dict(self) -> dict[str, object]:
+                    return {
+                        "design_name": "input.blif",
+                        "final_and": self.final_and_count,
+                        "final_lev": self.final_lev_count,
+                        "sequence": "balance",
+                    }
+
+            with patch.object(
+                sasyn_cli,
+                "_discover_designs_or_exit",
+                return_value={"input.blif": design_path},
+            ):
+                with patch.object(sasyn_cli, "ABCBackend", FakeCLIBackend):
+                    with patch.object(sasyn_cli, "run_search", return_value=FakeSearchResult()):
+                        exit_code = sasyn_cli.main(
+                            [
+                                "run-search",
+                                f"--workdir={workdir}",
+                                f"--dataset-root={design_path.parent}",
+                            ]
+                        )
+            self.assertEqual(exit_code, 0)
+            self.assertFalse((workdir / "base_aig").exists())
+        finally:
+            if workdir.exists():
+                shutil.rmtree(workdir)

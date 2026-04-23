@@ -1,0 +1,55 @@
+{
+  "meta": {
+    "abc_bin": "abc",
+    "benchmark_dir": "/home/hxy/MCTSyn/tc_public",
+    "num_benchmarks": 1
+  },
+  "results": [
+    {
+      "benchmark": "tc_public_30/input.blif",
+      "benchmark_path": "/home/hxy/MCTSyn/tc_public/tc_public_30/input.blif",
+      "status": "ok",
+      "initial": {
+        "nodes": 14139,
+        "level": 1036
+      },
+      "best": {
+        "nodes": 5174,
+        "level": 22,
+        "recipe_str": "resub; resub -z; rewrite; balance; balance; rewrite -z; rewrite; rewrite -z; rewrite -z; rewrite -z"
+      },
+      "improvement": {
+        "nodes_reduced": 8965,
+        "ratio": 0.6340618148383903
+      },
+      "config": {
+        "episodes": 20,
+        "steps_per_episode": 10,
+        "ucb_c": 0.4,
+        "and_reward_weight": 0.5,
+        "lev_reward_weight": 0.2,
+        "debug_search": false,
+        "seed": 0,
+        "step_reward_mode": "prefix_delta",
+        "prefix_cache": true
+      },
+      "runtime_sec": 15.632367068003077,
+      "peak_memory_kb": null,
+      "debug_trace": [],
+      "meta": {
+        "mode": "single_design",
+        "abc_bin": "abc"
+      }
+    }
+  ],
+  "summary": {
+    "total_cases": 1,
+    "success_cases": 1,
+    "failed_cases": 0,
+    "sum_initial_nodes": 14139,
+    "sum_best_nodes": 5174,
+    "sum_reduced_nodes": 8965,
+    "avg_improvement_ratio": 0.6340618148383903,
+    "global_improvement_ratio": 0.6340618148383903
+  }
+}

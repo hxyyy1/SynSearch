@@ -3,14 +3,16 @@ from __future__ import annotations
 import csv
 import io
 import json
+import re
 import shutil
+import subprocess
 import sys
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from MABSyn import baseline_mab, linucb, result_utils, summarize_results
+from MABSyn import baseline_mab, baseline_mab_prefix, linucb, result_utils, summarize_results
 
 
 class MABSynTests(unittest.TestCase):
@@ -37,6 +39,18 @@ class MABSynTests(unittest.TestCase):
         parsed_flag = baseline_mab.parse_optional_kv_args(["--debug-search", "--steps", "4"])
         self.assertEqual(parsed_flag["debug-search"], "true")
         self.assertEqual(parsed_flag["steps"], "4")
+        parsed_monitor = baseline_mab.parse_optional_kv_args(["--external-monitor", "--steps", "4"])
+        self.assertEqual(parsed_monitor["external-monitor"], "true")
+        prefix_args = baseline_mab_prefix._build_parser().parse_args(["run-search"])
+        self.assertEqual(prefix_args.ucb_c, baseline_mab_prefix.DEFAULT_BANDIT_C)
+        self.assertFalse(prefix_args.external_monitor)
+        self.assertTrue(
+            baseline_mab_prefix._build_parser().parse_args(["run-search", "--external-monitor"]).external_monitor
+        )
+        self.assertFalse(baseline_mab._build_parser().parse_args(["run-search"]).external_monitor)
+        self.assertTrue(baseline_mab._build_parser().parse_args(["run-search", "--external-monitor"]).external_monitor)
+        self.assertFalse(linucb._build_parser().parse_args(["run-search"]).external_monitor)
+        self.assertTrue(linucb._build_parser().parse_args(["run-search", "--external-monitor"]).external_monitor)
 
     def test_baseline_parse_stats_and_reward(self) -> None:
         nodes, level = baseline_mab.parse_abc_stats("i/o = 3/1 nd = 77 lev = 9")
@@ -44,15 +58,39 @@ class MABSynTests(unittest.TestCase):
         self.assertEqual(level, 9)
         self.assertAlmostEqual(
             baseline_mab.compute_reward(100, 80, 20, 16, True),
-            0.2,
+            20 ** 0.5 / 10,
         )
         self.assertAlmostEqual(
             baseline_mab.compute_reward(100, 80, 20, 10, True, and_reward_weight=0.5, lev_reward_weight=0.5),
-            0.35,
+            ((20 / 100) ** 0.5 + (10 / 20) ** 0.5) / 2,
         )
         self.assertEqual(
             baseline_mab.compute_reward(100, None, 20, None, False),
             baseline_mab.SEVERE_NEGATIVE_REWARD,
+        )
+        self.assertTrue(
+            baseline_mab.is_better_result(
+                reference_nodes=100,
+                reference_level=20,
+                candidate_nodes=82,
+                candidate_level=10,
+                incumbent_nodes=80,
+                incumbent_level=16,
+                and_reward_weight=0.5,
+                lev_reward_weight=0.5,
+            )
+        )
+        self.assertFalse(
+            baseline_mab.is_better_result(
+                reference_nodes=100,
+                reference_level=20,
+                candidate_nodes=80,
+                candidate_level=16,
+                incumbent_nodes=82,
+                incumbent_level=10,
+                and_reward_weight=0.5,
+                lev_reward_weight=0.5,
+            )
         )
 
     def test_debug_trace_csv_and_json_are_written_for_synthetic_result(self) -> None:
@@ -120,6 +158,130 @@ class MABSynTests(unittest.TestCase):
         ave_fanout, max_fanout = linucb.parse_fanout_stats("fanouts: ave = 1.50 max = 7")
         self.assertEqual((ave_fanout, max_fanout), (1.5, 7.0))
 
+    def test_baseline_prefix_cache_reuses_snapshots(self) -> None:
+        calls: list[str] = []
+
+        def fake_subprocess_run(args, capture_output, text, timeout, check):
+            self.assertTrue(capture_output)
+            self.assertTrue(text)
+            self.assertFalse(check)
+            self.assertEqual(timeout, 30)
+            command_string = args[2]
+            calls.append(command_string)
+            match = re.search(r"write_aiger\s+('([^']+)'|([^;]+))", command_string)
+            self.assertIsNotNone(match)
+            raw_path = match.group(2) or match.group(3)
+            snapshot_path = Path(str(raw_path).strip())
+            snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            snapshot_path.write_text("mock aig", encoding="utf-8")
+            if "read_blif" in command_string:
+                stdout = "and = 100 lev = 20"
+            else:
+                stdout = "and = 90 lev = 18"
+                self.assertIn("read_aiger", command_string)
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout=stdout, stderr="")
+
+        with patch.object(
+            baseline_mab_prefix.subprocess,
+            "run",
+            side_effect=fake_subprocess_run,
+        ):
+            cache = baseline_mab_prefix.PrefixCache("/tmp/mock.blif", abc_bin="abc", timeout_sec=30)
+            try:
+                root = cache.get_or_build(())
+                child = cache.get_or_build(("balance",))
+                child_cached = cache.get_or_build(("balance",))
+            finally:
+                cache.close()
+
+        self.assertTrue(root.success)
+        self.assertTrue(child.success)
+        self.assertTrue(child_cached.success)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(child.snapshot_path, child_cached.snapshot_path)
+        self.assertEqual(child.nodes, 90)
+        self.assertEqual(child.level, 18)
+
+    def test_baseline_prefix_best_recipe_uses_full_length_sequence(self) -> None:
+        class FakeBandit:
+            next_instance = 0
+
+            def __init__(self, action_list, c=0.0, rng=None):
+                del c, rng
+                self.actions = list(action_list)
+                self.total_steps = 0
+                self.counts = [0 for _ in self.actions]
+                self.q_values = [0.0 for _ in self.actions]
+                self.selected_index = FakeBandit.next_instance
+                FakeBandit.next_instance += 1
+
+            def select_action(self) -> int:
+                return self.selected_index
+
+            def update(self, trial_index, reward) -> None:
+                del trial_index, reward
+
+        class FakePrefixCache:
+            def __init__(self, blif_path, abc_bin, timeout_sec):
+                del blif_path, abc_bin, timeout_sec
+                self.peak_memory_kb = None
+                self.entries = {
+                    (): baseline_mab_prefix.PrefixCacheEntry(
+                        prefix=(),
+                        nodes=100,
+                        level=20,
+                        snapshot_path="/tmp/root.aig",
+                        success=True,
+                        runtime_sec=0.01,
+                        log="root",
+                        cache_hit=False,
+                        peak_memory_kb=None,
+                    ),
+                    ("balance",): baseline_mab_prefix.PrefixCacheEntry(
+                        prefix=("balance",),
+                        nodes=50,
+                        level=10,
+                        snapshot_path="/tmp/balance.aig",
+                        success=True,
+                        runtime_sec=0.01,
+                        log="balance",
+                        cache_hit=False,
+                        peak_memory_kb=None,
+                    ),
+                    ("balance", "rewrite"): baseline_mab_prefix.PrefixCacheEntry(
+                        prefix=("balance", "rewrite"),
+                        nodes=90,
+                        level=18,
+                        snapshot_path="/tmp/balance_rewrite.aig",
+                        success=True,
+                        runtime_sec=0.01,
+                        log="balance rewrite",
+                        cache_hit=False,
+                        peak_memory_kb=None,
+                    ),
+                }
+
+            def get_or_build(self, prefix):
+                return self.entries[prefix]
+
+            def close(self) -> None:
+                return None
+
+        FakeBandit.next_instance = 0
+        with patch.object(baseline_mab_prefix, "PrefixCache", FakePrefixCache):
+            with patch.object(baseline_mab_prefix, "UCBBandit", FakeBandit):
+                with patch.object(baseline_mab_prefix, "actions", ["balance", "rewrite"]):
+                    with patch.object(baseline_mab_prefix, "K_STEPS", 2):
+                        with patch.object(baseline_mab_prefix, "N_EPISODES", 1):
+                            result = baseline_mab_prefix.optimize_one_benchmark(
+                                "/tmp/mock.blif",
+                                benchmark_name="toy.blif",
+                            )
+
+        self.assertEqual(result["best"]["recipe_str"], "balance; rewrite")
+        self.assertEqual(result["best"]["nodes"], 90)
+        self.assertEqual(result["best"]["level"], 18)
+
     def test_result_utils_writes_under_workdir(self) -> None:
         workdir = result_utils.get_workdir()
         self.assertTrue(workdir.endswith(".mabsyn_work"))
@@ -157,16 +319,7 @@ class MABSynTests(unittest.TestCase):
             rows[0],
             [
                 "file",
-                "method",
                 "variant_label",
-                "steps",
-                "iterations",
-                "seed",
-                "ucb_c",
-                "alpha",
-                "lambda",
-                "and_reward_weight",
-                "lev_reward_weight",
                 "and",
                 "lev",
                 "runtime_sec",
@@ -174,10 +327,9 @@ class MABSynTests(unittest.TestCase):
             ],
         )
         self.assertEqual(rows[1][0], "tc_public_1/input.blif")
-        self.assertEqual(rows[1][1], "baseline_mab")
-        self.assertIn("method=baseline_mab", rows[1][2])
-        self.assertEqual(rows[1][11], "12")
-        self.assertEqual(rows[1][14], "2048")
+        self.assertIn("steps=", rows[1][1])
+        self.assertEqual(rows[1][2], "12")
+        self.assertEqual(rows[1][5], "2048")
         self.assertIn("CSV written to:", stdout.getvalue())
 
     def test_default_output_path_and_parent_creation(self) -> None:

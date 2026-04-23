@@ -5,6 +5,7 @@ import random
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from .backend import immediate_reward
 from .types import (
@@ -242,15 +243,30 @@ def _step_summary(
     )
 
 
-def run_search(config: SearchConfig, backend: SynthesisBackend) -> SearchResult:
-    started = time.perf_counter()
-    random.seed(config.seed)
-    baseline = backend.compute_baseline(config.design_path)
-    root_backend_result = backend.evaluate_prefix(config.design_path, ())
-    root = Node(prefix=(), and_count=root_backend_result.and_count, backend_result=root_backend_result)
-    steps: list[StepResult] = []
+def build_root_node(
+    design_path: Path,
+    prefix: tuple[str, ...],
+    backend: SynthesisBackend,
+) -> Node:
+    backend_result = backend.evaluate_prefix(design_path, prefix)
+    return Node(
+        prefix=prefix,
+        and_count=backend_result.and_count,
+        backend_result=backend_result,
+    )
 
-    for step_index in range(1, config.sequence_length + 1):
+
+def search_from_root(
+    root: Node,
+    config: SearchConfig,
+    baseline: BaselineInfo,
+    backend: SynthesisBackend,
+    *,
+    start_step_index: int = 1,
+    step_callback: Callable[[StepResult], None] | None = None,
+) -> tuple[Node, tuple[StepResult, ...]]:
+    steps: list[StepResult] = []
+    for step_index in range(start_step_index, config.sequence_length + 1):
         iteration_traces: list[dict[str, object]] = []
         for iteration_index in range(1, config.search_iterations + 1):
             trace = _run_iteration(root, config, baseline, backend, iteration_index)
@@ -262,16 +278,26 @@ def run_search(config: SearchConfig, backend: SynthesisBackend) -> SearchResult:
             root.children.values(),
             key=lambda edge: (edge.q_value + edge.reward, edge.action),
         )
-        steps.append(
-            _step_summary(
-                step_index,
-                root,
-                selected_edge.action,
-                config,
-                tuple(iteration_traces),
-            )
+        step_result = _step_summary(
+            step_index,
+            root,
+            selected_edge.action,
+            config,
+            tuple(iteration_traces),
         )
+        steps.append(step_result)
+        if step_callback is not None:
+            step_callback(step_result)
         root = selected_edge.child
+    return root, tuple(steps)
+
+
+def run_search(config: SearchConfig, backend: SynthesisBackend) -> SearchResult:
+    started = time.perf_counter()
+    random.seed(config.seed)
+    baseline = backend.compute_baseline(config.design_path)
+    root = build_root_node(config.design_path, (), backend)
+    root, steps = search_from_root(root, config, baseline, backend)
 
     peak_memory_getter = getattr(backend, "get_peak_memory_kb", None)
     return SearchResult(
@@ -285,7 +311,7 @@ def run_search(config: SearchConfig, backend: SynthesisBackend) -> SearchResult:
         total_runtime_sec=time.perf_counter() - started,
         peak_memory_kb=peak_memory_getter() if callable(peak_memory_getter) else None,
         baseline=baseline,
-        steps=tuple(steps),
+        steps=steps,
         metadata={
             "config": config.to_json_dict(),
             "implementation": "AlphaSyn w/o nn core only",

@@ -36,10 +36,8 @@ def main(argv: list[str] | None = None) -> None:
 
     table_rows = result_utils.extract_table_rows(rows)
     results_root = result_utils.get_results_root()
-    if method_names and len(method_names) == 1 and method_names[0] == "linucb":
-        result_path = os.path.join(results_root, "linucb")
-    elif method_names and len(method_names) == 1 and method_names[0] == "baseline_mab":
-        result_path = os.path.join(results_root, "baseline_mab")
+    if method_names and len(method_names) == 1:
+        result_path = os.path.join(results_root, method_names[0])
     else:
         result_path = results_root
     csv_path = os.path.join(result_path, "summary.csv")
@@ -49,7 +47,7 @@ def main(argv: list[str] | None = None) -> None:
         writer.writerow(
             (
                 "file",
-                "method",
+                # "method",
                 "variant_label",
                 # "steps",
                 # "iterations",
@@ -66,7 +64,7 @@ def main(argv: list[str] | None = None) -> None:
             )
         )
         writer.writerows(table_rows)
-    print(csv_path)
+    print(f"CSV written to: {csv_path}")
 
 
 if __name__ == "__main__":

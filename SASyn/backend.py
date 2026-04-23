@@ -8,8 +8,6 @@ import subprocess
 import time
 from pathlib import Path
 
-from memory_utils import run_command_with_peak_memory
-
 from .core_types import (
     ACTION_TO_ABC_COMMAND,
     BackendResult,
@@ -60,7 +58,6 @@ class ABCBackend:
         self.abc_bin = abc_bin or self._discover_abc()
         self._version: str | None = None
         self._prepared_bases: dict[Path, Path] = {}
-        self._peak_memory_kb: float | None = None
 
     def _discover_abc(self) -> str:
         for candidate in ("abc", "yosys-abc", "berkeley-abc"):
@@ -77,20 +74,15 @@ class ABCBackend:
         return self._version
 
     def get_peak_memory_kb(self) -> float | None:
-        return self._peak_memory_kb
-
-    def _observe_peak_memory_kb(self, peak_memory_kb: float | None) -> None:
-        if peak_memory_kb is None:
-            return
-        if self._peak_memory_kb is None or peak_memory_kb > self._peak_memory_kb:
-            self._peak_memory_kb = peak_memory_kb
+        return None
 
     def _probe_version(self) -> str:
         for command in ("version", "print_stats", "help"):
             try:
-                completed, _ = run_command_with_peak_memory(
+                completed = subprocess.run(
                     [self.abc_bin, "-c", command],
                     check=True,
+                    capture_output=True,
                     text=True,
                 )
             except (OSError, subprocess.CalledProcessError):
@@ -137,9 +129,10 @@ class ABCBackend:
         )
         started = time.perf_counter()
         try:
-            completed, peak_memory_kb = run_command_with_peak_memory(
+            completed = subprocess.run(
                 [self.abc_bin, "-c", command_string],
                 check=True,
+                capture_output=True,
                 text=True,
             )
         except OSError as exc:
@@ -152,7 +145,6 @@ class ABCBackend:
                 f"Output:\n{payload.strip()}"
             ) from exc
         runtime_sec = time.perf_counter() - started
-        self._observe_peak_memory_kb(peak_memory_kb)
         payload = (completed.stdout + "\n" + completed.stderr).strip()
         and_count, lev_count = parse_abc_stats(payload)
         return BackendResult(
@@ -160,7 +152,7 @@ class ABCBackend:
             lev_count=lev_count,
             runtime_sec=runtime_sec,
             log=payload,
-            peak_memory_kb=peak_memory_kb,
+            peak_memory_kb=None,
         )
 
     def _prepare_base_aig(self, design_path: Path) -> Path:
@@ -179,9 +171,10 @@ class ABCBackend:
             ]
         )
         try:
-            _, peak_memory_kb = run_command_with_peak_memory(
+            subprocess.run(
                 [self.abc_bin, "-c", command_string],
                 check=True,
+                capture_output=True,
                 text=True,
             )
         except OSError as exc:
@@ -194,6 +187,9 @@ class ABCBackend:
                 f"Output:\n{payload.strip()}"
             ) from exc
 
-        self._observe_peak_memory_kb(peak_memory_kb)
         self._prepared_bases[resolved_design] = base_aig_path
         return base_aig_path
+
+    def cleanup_base_aig(self) -> None:
+        if self.base_aig_dir.exists():
+            shutil.rmtree(self.base_aig_dir, ignore_errors=True)

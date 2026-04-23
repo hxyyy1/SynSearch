@@ -30,7 +30,12 @@ from dataclasses import asdict, dataclass
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 import numpy as np
 
-from memory_utils import read_linux_peak_memory_kb
+from external_monitoring import (
+    is_external_monitor_active,
+    remove_flag,
+    run_under_external_monitor,
+    upsert_option,
+)
 from . import result_utils, summarize_results
 
 
@@ -152,7 +157,6 @@ class ABCSession:
         self.reader_error: Optional[BaseException] = None
         self.recv_buffer = bytearray()
         self._queue_eof = object()
-        self.peak_memory_kb: float | None = None
 
     def __enter__(self) -> "ABCSession":
         self.start()
@@ -182,12 +186,10 @@ class ABCSession:
             daemon=True,
         )
         self.reader_thread.start()
-        self._update_peak_memory_kb()
 
     def close(self) -> None:
         if self.process is None:
             return
-        self._update_peak_memory_kb()
 
         try:
             if self.process.poll() is None and self.process.stdin is not None:
@@ -314,7 +316,6 @@ class ABCSession:
                         del self.recv_buffer[: line_end_idx + 1]
                     else:
                         del self.recv_buffer[:]
-                    self._update_peak_memory_kb()
                     return captured.decode("utf-8", errors="replace")
 
                 safe_cut = max(0, len(self.recv_buffer) - len(end_marker_bytes))
@@ -333,15 +334,6 @@ class ABCSession:
                     f"returncode={return_code}, partial_output={partial_output[-2000:]}"
                 )
             self.recv_buffer.extend(chunk)
-
-    def _update_peak_memory_kb(self) -> None:
-        if self.process is None:
-            return
-        current_peak = read_linux_peak_memory_kb(self.process.pid)
-        if current_peak is None:
-            return
-        if self.peak_memory_kb is None or current_peak > self.peak_memory_kb:
-            self.peak_memory_kb = current_peak
 
     def _reader_loop(self) -> None:
         try:
@@ -465,7 +457,6 @@ class PrefixCache:
         self.cache_dir = os.path.join(cache_root, uuid.uuid4().hex)
         os.makedirs(self.cache_dir, exist_ok=True)
         self.entries: Dict[Tuple[str, ...], PrefixCacheEntry] = {}
-        self.peak_memory_kb: float | None = None
 
     def close(self) -> None:
         shutil.rmtree(self.cache_dir, ignore_errors=True)
@@ -478,16 +469,22 @@ class PrefixCache:
         snapshot_path = os.path.join(self.cache_dir, f"{self._cache_key(prefix)}.aig")
         if prefix:
             parent = self.get_or_build(prefix[:-1])
-            with ABCSession(parent.snapshot_path, abc_bin=self.abc_bin, timeout_sec=self.timeout_sec) as session:
+            with ABCSession(
+                parent.snapshot_path,
+                abc_bin=self.abc_bin,
+                timeout_sec=self.timeout_sec,
+            ) as session:
                 _, _ = session.initialize()
                 current_stats, _ = session.apply_action(prefix[-1], len(prefix))
                 session.write_current_design(snapshot_path, f"prefix_{len(prefix)}")
-                self._observe_peak_memory_kb(session.peak_memory_kb)
         else:
-            with ABCSession(self.root_design_path, abc_bin=self.abc_bin, timeout_sec=self.timeout_sec) as session:
+            with ABCSession(
+                self.root_design_path,
+                abc_bin=self.abc_bin,
+                timeout_sec=self.timeout_sec,
+            ) as session:
                 current_stats, _ = session.initialize()
                 session.write_current_design(snapshot_path, "prefix_root")
-                self._observe_peak_memory_kb(session.peak_memory_kb)
 
         entry = PrefixCacheEntry(
             prefix=prefix,
@@ -501,12 +498,6 @@ class PrefixCache:
         )
         self.entries[prefix] = entry
         return entry
-
-    def _observe_peak_memory_kb(self, peak_memory_kb: float | None) -> None:
-        if peak_memory_kb is None:
-            return
-        if self.peak_memory_kb is None or peak_memory_kb > self.peak_memory_kb:
-            self.peak_memory_kb = peak_memory_kb
 
     def trace_for_actions(
         self,
@@ -962,12 +953,14 @@ def optimize_one_benchmark(
     logging.info("开始处理: %s", benchmark_name)
     abc_bin = abc_bin or ABC_BIN
     started = time.perf_counter()
-    peak_memory_kb: float | None = None
 
     try:
-        with ABCSession(blif_path, abc_bin=abc_bin, timeout_sec=ABC_TIMEOUT_SEC) as session:
+        with ABCSession(
+            blif_path,
+            abc_bin=abc_bin,
+            timeout_sec=ABC_TIMEOUT_SEC,
+        ) as session:
             initial_stats, _ = session.initialize()
-            peak_memory_kb = session.peak_memory_kb
     except Exception as exc:
         logging.error("初始评估失败: %s", benchmark_name)
         logging.debug("初始输出异常: %s", exc)
@@ -977,7 +970,7 @@ def optimize_one_benchmark(
             "status": "failed_init",
             "error": str(exc),
             "runtime_sec": time.perf_counter() - started,
-            "peak_memory_kb": peak_memory_kb,
+            "peak_memory_kb": None,
         }
 
     context_encoder = ContextEncoder(initial_stats)
@@ -1328,10 +1321,6 @@ def optimize_one_benchmark(
 
             step_idx += 1
     finally:
-        if prefix_cache.peak_memory_kb is not None and (
-            peak_memory_kb is None or prefix_cache.peak_memory_kb > peak_memory_kb
-        ):
-            peak_memory_kb = prefix_cache.peak_memory_kb
         prefix_cache.close()
 
     improvement = initial_stats.nodes - current_stats.nodes
@@ -1368,7 +1357,7 @@ def optimize_one_benchmark(
             "seed": seed,
         },
         "runtime_sec": time.perf_counter() - started,
-        "peak_memory_kb": peak_memory_kb,
+        "peak_memory_kb": None,
     }
 
 
@@ -1463,6 +1452,11 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--return-back-threshold", type=float, default=RETURN_BACK_THRESHOLD)
     run.add_argument("--actions", default=None)
     run.add_argument("--result-json", type=Path, default=None)
+    run.add_argument(
+        "--external-monitor",
+        action="store_true",
+        help="Run each selected design under the external monitor and patch result JSON metrics.",
+    )
     run.add_argument("--log-level", default="INFO")
 
     summarize = subparsers.add_parser("summarize", help="Aggregate JSON search results into CSV.")
@@ -1595,8 +1589,32 @@ def _command_summarize(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = _build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw_argv)
+    if (
+        args.command == "run-search"
+        and args.external_monitor
+        and not is_external_monitor_active()
+    ):
+        args.workdir = _resolve_local_path(args.workdir)
+        result_utils.set_workdir(str(args.workdir))
+        base_argv = remove_flag(raw_argv, "--external-monitor")
+        designs = _discover_designs_or_exit(args.dataset_root)
+        selected_designs = [args.design] if args.design else sorted(designs, key=natural_sort_key)
+        for design_name in selected_designs:
+            patch_json = Path(
+                result_utils.get_method_results_dir("linucb")
+            ) / result_utils.benchmark_to_result_filename(design_name)
+            design_argv = upsert_option(base_argv, "--design", design_name)
+            exit_code = run_under_external_monitor(
+                raw_argv=design_argv,
+                patch_json=patch_json,
+                module_name="MABSyn.linucb",
+            )
+            if exit_code != 0:
+                return exit_code
+        return 0
     if args.command == "run-search":
         return _command_run_search(args)
     if args.command == "summarize":

@@ -5,12 +5,26 @@ import csv
 import json
 import os
 import re
+import sys
 from pathlib import Path
+
+from external_monitoring import (
+    is_external_monitor_active,
+    remove_flag,
+    run_under_external_monitor,
+    upsert_option,
+)
 
 from .backend import ABCBackend, BackendError
 from .dataset import discover_blif_designs, write_manifest
 from .mcts import run_search
-from .types import SearchConfig, SearchResult, format_sequence_for_abc
+from .types import (
+    ACTION_TO_ABC_COMMAND,
+    DEFAULT_ACTION_SPACE,
+    SearchConfig,
+    SearchResult,
+    format_sequence_for_abc,
+)
 
 
 def _resolve_local_path(path: Path) -> Path:
@@ -19,6 +33,21 @@ def _resolve_local_path(path: Path) -> Path:
     if not candidate.is_relative_to(cwd):
         raise SystemExit(f"Path '{path}' must stay under the current working directory: {cwd}")
     return candidate
+
+
+def _parse_action_space(raw_actions: str | None) -> tuple[str, ...]:
+    if raw_actions is None:
+        return DEFAULT_ACTION_SPACE
+    parsed = tuple(item.strip() for item in raw_actions.split(",") if item.strip())
+    if not parsed:
+        raise SystemExit("--actions must contain at least one action.")
+    unknown = [item for item in parsed if item not in ACTION_TO_ABC_COMMAND]
+    if unknown:
+        available = ", ".join(sorted(ACTION_TO_ABC_COMMAND))
+        raise SystemExit(
+            f"Unknown action(s) in --actions: {', '.join(unknown)}. Available actions: {available}"
+        )
+    return parsed
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -58,6 +87,12 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--cpuct", type=float, default=1.0)
     run.add_argument("--mu-discount", type=float, default=0.9)
     run.add_argument("--seed", type=int, default=0)
+    run.add_argument("--actions", default=None, help="Comma-separated action labels to search.")
+    run.add_argument(
+        "--external-monitor",
+        action="store_true",
+        help="Run each selected design under the external monitor and patch result JSON metrics.",
+    )
     run.add_argument(
         "--debug-search",
         action="store_true",
@@ -171,6 +206,7 @@ def _command_run_search(args: argparse.Namespace) -> int:
             config = SearchConfig(
                 design_name=design_name,
                 design_path=design_path,
+                action_space=_parse_action_space(args.actions),
                 sequence_length=args.sequence_length,
                 search_iterations=args.search_iterations,
                 cpuct=args.cpuct,
@@ -202,6 +238,26 @@ def _command_run_search(args: argparse.Namespace) -> int:
                 print(f"output_trace_csv: {trace_csv_path}")
     finally:
         backend.cleanup_cache()
+    return 0
+
+
+def _run_with_external_monitor(args: argparse.Namespace, raw_argv: list[str]) -> int | None:
+    if is_external_monitor_active() or not args.external_monitor:
+        return None
+    args.workdir = _resolve_local_path(args.workdir)
+    base_argv = remove_flag(raw_argv, "--external-monitor")
+    designs = _discover_designs_or_exit(args.dataset_root)
+    selected_designs = [args.design] if args.design else sorted(designs, key=_design_sort_key)
+    for design_name in selected_designs:
+        patch_json = args.workdir / "results" / f"{_result_file_stem(design_name)}.{_cpuct_tag(args.cpuct)}.json"
+        design_argv = upsert_option(base_argv, "--design", design_name)
+        exit_code = run_under_external_monitor(
+            raw_argv=design_argv,
+            patch_json=patch_json,
+            module_name="alphasyn",
+        )
+        if exit_code != 0:
+            return exit_code
     return 0
 
 
@@ -394,13 +450,17 @@ def _command_summarize(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = _build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw_argv)
 
     try:
         if args.command == "prepare-data":
             return _command_prepare_data(args)
         if args.command == "run-search":
+            monitored = _run_with_external_monitor(args, raw_argv)
+            if monitored is not None:
+                return monitored
             return _command_run_search(args)
         if args.command == "summarize":
             return _command_summarize(args)

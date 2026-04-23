@@ -23,6 +23,14 @@ ACTION_TO_ABC_COMMAND = {
     "refactor-z": "refactor -z",
     "resub": "resub",
     "resub-z": "resub -z",
+    "fraig": "fraig",
+    "fx": "renode; sop; fx; strash",
+    "mfs": "renode; mfs; strash",
+    "dsd": "dsd; strash",
+    "dch": "dch; strash",
+    "extract": "extract",
+    "extract-a": "extract -a",
+    "collapse": "collapse; strash",
 }
 
 RESYN2_EXPANDED_ACTIONS = (

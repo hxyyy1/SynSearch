@@ -1,0 +1,21 @@
+{
+  "alphasyn": {
+    "sequence-length": 10,
+    "search-iterations": 20,
+    "cpuct": 1.0,
+    "mu-discount": 0.9,
+    "seed": 0
+  },
+  "baseline_mab": {
+    "steps": 10,
+    "episodes": 20,
+    "ucb-c": 0.4,
+    "seed": 0
+  },
+  "baseline_mab_prefix": {
+    "steps": 10,
+    "episodes": 20,
+    "ucb-c": 0.8,
+    "seed": 0
+  }
+}

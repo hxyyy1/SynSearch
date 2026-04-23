@@ -7,11 +7,19 @@ from pathlib import Path
 from typing import Iterable
 
 
-DEFAULT_SUMMARIES = {
-    "MCTSyn": Path(".alphasyn_work/summary.csv"),
-    "SASyn": Path(".sasyn_work/summary.csv"),
-    "MABSyn": Path(".mabsyn_work/results/baseline_mab/summary.csv"),
-}
+@dataclass(frozen=True)
+class SummarySpec:
+    name: str
+    path: Path
+
+
+DEFAULT_SUMMARIES = (
+    SummarySpec("MCTSyn", Path(".alphasyn_work/summary.csv")),
+    SummarySpec("HybridSyn", Path(".hybridsyn_work/summary.csv")),
+    SummarySpec("SASyn", Path(".sasyn_work/summary.csv")),
+    SummarySpec("MABSyn-UCB1", Path(".mabsyn_work/results/baseline_mab/summary.csv")),
+    SummarySpec("MABSyn-UCB1Prefix", Path(".mabsyn_work/results/baseline_mab_prefix/summary.csv")),
+)
 DEFAULT_OUTPUT = Path(".compare_results/aggregate.csv")
 DEFAULT_DETAILS_OUTPUT = Path(".compare_results/details.csv")
 
@@ -22,12 +30,6 @@ METRIC_COLUMNS = {
     "runtime": ("total_runtime_sec", "runtime_sec"),
     "memory": ("peak_memory_mb", "peak_memory_kb", "peak_memory", "memory_mb", "memory_kb", "memory"),
 }
-
-
-@dataclass(frozen=True)
-class SummarySpec:
-    name: str
-    path: Path
 
 
 @dataclass(frozen=True)
@@ -53,7 +55,7 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="NAME=PATH",
         help=(
             "Algorithm summary to compare. Can be passed multiple times. "
-            "Default: MCTSyn/SASyn/MABSyn project summaries."
+            "Default: MCTSyn/HybridSyn/SASyn/MABSyn-UCB1/MABSyn-UCB1Prefix project summaries."
         ),
     )
     parser.add_argument(
@@ -88,7 +90,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _parse_summary_specs(raw_specs: list[str]) -> list[SummarySpec]:
     if not raw_specs:
-        return [SummarySpec(name, path) for name, path in DEFAULT_SUMMARIES.items()]
+        return list(DEFAULT_SUMMARIES)
 
     specs: list[SummarySpec] = []
     for raw_spec in raw_specs:
@@ -120,7 +122,11 @@ def _parse_float(value: str, field_name: str, design_name: str, source: Path) ->
         ) from exc
 
 
-def load_summary(spec: SummarySpec) -> LoadedSummary:
+def _is_missing_value(value: str) -> bool:
+    return value.strip().lower() in {"", "-", "na", "n/a", "none", "null"}
+
+
+def load_summaries(spec: SummarySpec) -> list[LoadedSummary]:
     path = spec.path.resolve()
     if not path.exists():
         raise SystemExit(f"Summary file not found for {spec.name}: {path}")
@@ -147,59 +153,65 @@ def load_summary(spec: SummarySpec) -> LoadedSummary:
                 f"Summary {path} is missing required columns for metrics: {', '.join(missing_required)}"
             )
 
-        rows: dict[str, dict[str, float | None]] = {}
-        variant_labels: set[str] = set()
+        rows_by_variant: dict[str | None, dict[str, dict[str, float | None]]] = {}
         for raw_row in reader:
             design_name = (raw_row.get(design_column) or "").strip()
             if not design_name:
                 continue
             variant_label = (raw_row.get("variant_label") or "").strip()
-            if variant_label:
-                variant_labels.add(variant_label)
+            variant_key = variant_label or None
             metrics: dict[str, float | None] = {}
             for metric_name, column_name in metric_columns.items():
                 raw_value = (raw_row.get(column_name) or "").strip()
-                if not raw_value:
+                if _is_missing_value(raw_value):
                     metrics[metric_name] = None
                     continue
                 metrics[metric_name] = _parse_float(raw_value, column_name, design_name, path)
-            rows[design_name] = metrics
+            variant_rows = rows_by_variant.setdefault(variant_key, {})
+            if design_name in variant_rows:
+                label_text = variant_label or "-"
+                raise SystemExit(
+                    f"Summary {path} contains duplicate rows for design '{design_name}' "
+                    f"under variant_label '{label_text}'."
+                )
+            variant_rows[design_name] = metrics
 
-    if not rows:
+    if not rows_by_variant:
         raise SystemExit(f"Summary {path} does not contain any usable rows.")
-    if len(variant_labels) > 1:
-        raise SystemExit(
-            f"Summary {path} contains multiple variant_label values; please split different parameter runs into separate summaries."
+    return [
+        LoadedSummary(
+            spec=SummarySpec(spec.name, path),
+            design_column=design_column,
+            metric_columns=metric_columns,
+            rows=rows,
+            variant_label=variant_label,
         )
-
-    return LoadedSummary(
-        spec=SummarySpec(spec.name, path),
-        design_column=design_column,
-        metric_columns=metric_columns,
-        rows=rows,
-        variant_label=next(iter(variant_labels)) if variant_labels else None,
-    )
+        for variant_label, rows in sorted(
+            rows_by_variant.items(),
+            key=lambda item: _natural_key(item[0] or ""),
+        )
+    ]
 
 
-def _natural_key(text: str) -> tuple[object, ...]:
-    parts: list[object] = []
+def _natural_key(text: str) -> tuple[tuple[int, object], ...]:
+    parts: list[tuple[int, object]] = []
     current = ""
     in_digits = False
     for char in text:
         if char.isdigit():
             if not in_digits and current:
-                parts.append(current.lower())
+                parts.append((1, current.lower()))
                 current = ""
             current += char
             in_digits = True
         else:
             if in_digits and current:
-                parts.append(int(current))
+                parts.append((0, int(current)))
                 current = ""
             current += char
             in_digits = False
     if current:
-        parts.append(int(current) if in_digits else current.lower())
+        parts.append((0, int(current)) if in_digits else (1, current.lower()))
     return tuple(parts)
 
 
@@ -218,12 +230,12 @@ def _format_table(headers: list[str], rows: list[list[str]]) -> str:
 
 def _shared_designs(summaries: list[LoadedSummary], policy: str) -> list[str]:
     design_sets = [set(summary.rows) for summary in summaries]
-    shared = set.intersection(*design_sets)
-    if not shared:
-        raise SystemExit("No common designs were found across the provided summaries.")
+    union = set.union(*design_sets)
+    if not union:
+        raise SystemExit("No designs were found across the provided summaries.")
 
     if policy == "error":
-        union = set.union(*design_sets)
+        shared = set.intersection(*design_sets)
         if shared != union:
             missing_lines: list[str] = []
             for summary in summaries:
@@ -233,7 +245,7 @@ def _shared_designs(summaries: list[LoadedSummary], policy: str) -> list[str]:
             detail = "\n".join(missing_lines)
             raise SystemExit(f"Summaries do not cover the same designs:\n{detail}")
 
-    return sorted(shared, key=_natural_key)
+    return sorted(union, key=_natural_key)
 
 
 def _summary_has_metric(summary: LoadedSummary, design_name: str, metric_name: str) -> bool:
@@ -258,6 +270,55 @@ def _active_metrics(
     return active
 
 
+def _score_for_rank(rank: int) -> int:
+    if rank <= 1:
+        return 10
+    if rank == 2:
+        return 9
+    if rank == 3:
+        return 8
+    if rank == 4:
+        return 7
+    if rank == 5:
+        return 6
+    return 5
+
+
+def _compute_metric_ranks(
+    eligible_summaries: list[LoadedSummary],
+    design_name: str,
+    metric_name: str,
+) -> dict[tuple[str, str | None, str], tuple[int, int]]:
+    ranked_values = sorted(
+        [
+            (
+                float(summary.rows[design_name][metric_name]),
+                summary.spec.name,
+                summary.variant_label,
+                str(summary.spec.path),
+            )
+            for summary in eligible_summaries
+        ],
+        key=lambda item: (
+            item[0],
+            _natural_key(item[1]),
+            _natural_key(item[2] or ""),
+        ),
+    )
+    metric_ranks: dict[tuple[str, str | None, str], tuple[int, int]] = {}
+    previous_value: float | None = None
+    current_rank = 0
+    for index, (value, algorithm, variant_label, summary_path) in enumerate(ranked_values, start=1):
+        if previous_value is None or value != previous_value:
+            current_rank = index
+            previous_value = value
+        metric_ranks[(algorithm, variant_label, summary_path)] = (
+            current_rank,
+            _score_for_rank(current_rank),
+        )
+    return metric_ranks
+
+
 def compare_summaries(
     summaries: list[LoadedSummary],
     *,
@@ -270,42 +331,49 @@ def compare_summaries(
     if active_weight_sum <= 0:
         raise SystemExit("The sum of active metric weights must be positive.")
 
+    compared_designs: set[str] = set()
     detail_rows: list[dict[str, object]] = []
     aggregate_rows: list[dict[str, object]] = []
-    scores_by_algorithm: dict[str, list[dict[str, float | None]]] = {summary.spec.name: [] for summary in summaries}
+    scores_by_summary: dict[tuple[str, str | None, str], list[dict[str, float | None]]] = {
+        (summary.spec.name, summary.variant_label, str(summary.spec.path)): []
+        for summary in summaries
+    }
 
     for design_name in designs:
-        design_metrics = [
-            metric_name
-            for metric_name in metrics
-            if all(_summary_has_metric(summary, design_name, metric_name) for summary in summaries)
+        summaries_for_design = [summary for summary in summaries if design_name in summary.rows]
+        eligible_summaries = [
+            summary
+            for summary in summaries_for_design
+            if all(_summary_has_metric(summary, design_name, metric_name) for metric_name in metrics)
         ]
+        if len(eligible_summaries) < 2:
+            continue
+        design_metrics = list(metrics)
         if not design_metrics:
             continue
-
-        denominators = {
-            metric_name: max(float(summary.rows[design_name][metric_name]) for summary in summaries)
+        compared_designs.add(design_name)
+        design_weight_sum = sum(weights[metric_name] for metric_name in design_metrics)
+        metric_rankings = {
+            metric_name: _compute_metric_ranks(eligible_summaries, design_name, metric_name)
             for metric_name in design_metrics
         }
-        design_weight_sum = sum(weights[metric_name] for metric_name in design_metrics)
-        for summary in summaries:
+        for summary in eligible_summaries:
             raw_metrics = summary.rows[design_name]
-            normalized_metrics = {
-                metric_name: (
-                    float(raw_metrics[metric_name]) / denominators[metric_name]
-                    if denominators[metric_name] > 0
-                    else 0.0
-                )
+            summary_key = (summary.spec.name, summary.variant_label, str(summary.spec.path))
+            metric_scores = {
+                metric_name: metric_rankings[metric_name][summary_key][1]
                 for metric_name in design_metrics
             }
-            weighted_cost = sum(
-                weights[metric_name] * normalized_metrics[metric_name]
+            metric_ranks = {
+                metric_name: metric_rankings[metric_name][summary_key][0]
+                for metric_name in design_metrics
+            }
+            final_score = sum(
+                weights[metric_name] * metric_scores[metric_name]
                 for metric_name in design_metrics
             )
-            final_score = 100.0 * (1.0 - (weighted_cost / design_weight_sum))
-            scores_by_algorithm[summary.spec.name].append(
+            scores_by_summary[summary_key].append(
                 {
-                    "weighted_cost": weighted_cost,
                     "final_score": final_score,
                     "weight_sum": design_weight_sum,
                     **{
@@ -315,7 +383,11 @@ def compare_summaries(
                         for metric_name in metrics
                     },
                     **{
-                        f"norm_{metric_name}": normalized_metrics.get(metric_name)
+                        f"{metric_name}_rank": metric_ranks.get(metric_name)
+                        for metric_name in metrics
+                    },
+                    **{
+                        f"{metric_name}_score": metric_scores.get(metric_name)
                         for metric_name in metrics
                     },
                 }
@@ -324,51 +396,78 @@ def compare_summaries(
                 "algorithm": summary.spec.name,
                 "variant_label": summary.variant_label,
                 "design": design_name,
-                "weighted_cost": weighted_cost,
                 "final_score": final_score,
                 "active_weight_sum": design_weight_sum,
             }
             for metric_name in metrics:
                 detail_row[f"{metric_name}"] = raw_metrics.get(metric_name)
-                detail_row[f"max_{metric_name}"] = denominators.get(metric_name)
-                detail_row[f"norm_{metric_name}"] = normalized_metrics.get(metric_name)
+                detail_row[f"{metric_name}_rank"] = metric_ranks.get(metric_name)
+                detail_row[f"{metric_name}_score"] = metric_scores.get(metric_name)
             detail_rows.append(detail_row)
 
+    if not detail_rows:
+        raise SystemExit("No comparable designs were found across the provided summaries.")
+
     for summary in summaries:
-        algorithm_scores = scores_by_algorithm[summary.spec.name]
+        summary_key = (summary.spec.name, summary.variant_label, str(summary.spec.path))
+        algorithm_scores = scores_by_summary[summary_key]
         if not algorithm_scores:
             continue
         row: dict[str, object] = {
             "algorithm": summary.spec.name,
             "variant_label": summary.variant_label,
             "design_count": len(algorithm_scores),
-            "weighted_cost": sum(item["weighted_cost"] for item in algorithm_scores) / len(algorithm_scores),
-            "final_score": sum(item["final_score"] for item in algorithm_scores) / len(algorithm_scores),
+            "final_score": sum(float(item["final_score"]) for item in algorithm_scores),
             "summary_path": str(summary.spec.path),
         }
         for metric_name in metrics:
             raw_values = [item[f"raw_{metric_name}"] for item in algorithm_scores if item[f"raw_{metric_name}"] is not None]
-            norm_values = [item[f"norm_{metric_name}"] for item in algorithm_scores if item[f"norm_{metric_name}"] is not None]
+            rank_values = [item[f"{metric_name}_rank"] for item in algorithm_scores if item[f"{metric_name}_rank"] is not None]
+            score_values = [item[f"{metric_name}_score"] for item in algorithm_scores if item[f"{metric_name}_score"] is not None]
             row[f"avg_{metric_name}"] = (sum(raw_values) / len(raw_values)) if raw_values else None
-            row[f"avg_norm_{metric_name}"] = (sum(norm_values) / len(norm_values)) if norm_values else None
+            row[f"avg_{metric_name}_rank"] = (sum(rank_values) / len(rank_values)) if rank_values else None
+            row[f"avg_{metric_name}_score"] = (sum(score_values) / len(score_values)) if score_values else None
         aggregate_rows.append(row)
 
     aggregate_rows.sort(
         key=lambda row: (
             -float(row["final_score"]),
-            float(row["weighted_cost"]),
             _natural_key(str(row["algorithm"])),
             _natural_key(str(row.get("variant_label") or "")),
         )
     )
-    detail_rows.sort(
-        key=lambda row: (
-            _natural_key(str(row["design"])),
-            _natural_key(str(row["algorithm"])),
-            _natural_key(str(row.get("variant_label") or "")),
+    ranked_detail_rows: list[dict[str, object]] = []
+    for design_name in sorted(compared_designs, key=_natural_key):
+        design_rows = [row for row in detail_rows if row["design"] == design_name]
+        design_rows.sort(
+            key=lambda row: (
+                -float(row["final_score"]),
+                _natural_key(str(row["algorithm"])),
+                _natural_key(str(row.get("variant_label") or "")),
+            )
         )
-    )
-    return aggregate_rows, detail_rows, designs, metrics, active_weight_sum
+        previous_score: float | None = None
+        current_rank = 0
+        for index, row in enumerate(design_rows, start=1):
+            score = float(row["final_score"])
+            if previous_score is None or score != previous_score:
+                current_rank = index
+                previous_score = score
+            ranked_row = {
+                "design": row["design"],
+                "rank": current_rank,
+                "algorithm": row["algorithm"],
+                "variant_label": row["variant_label"],
+                "final_score": row["final_score"],
+                "active_weight_sum": row["active_weight_sum"],
+            }
+            for metric_name in metrics:
+                ranked_row[metric_name] = row[metric_name]
+                ranked_row[f"{metric_name}_rank"] = row[f"{metric_name}_rank"]
+                ranked_row[f"{metric_name}_score"] = row[f"{metric_name}_score"]
+            ranked_detail_rows.append(ranked_row)
+    detail_rows = ranked_detail_rows
+    return aggregate_rows, detail_rows, sorted(compared_designs, key=_natural_key), metrics, active_weight_sum
 
 
 def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
@@ -407,10 +506,11 @@ def _print_report(
             f"(active weight sum = {active_weight_sum:.3f})."
         )
 
-    aggregate_headers = ["rank", "algorithm", "variant_label", "designs", "weighted_cost", "final_score"]
+    aggregate_headers = ["rank", "algorithm", "variant_label", "designs", "final_score"]
     for metric_name in metrics:
         aggregate_headers.append(f"avg_{metric_name}")
-        aggregate_headers.append(f"avg_norm_{metric_name}")
+        aggregate_headers.append(f"avg_{metric_name}_rank")
+        aggregate_headers.append(f"avg_{metric_name}_score")
     aggregate_rows_text: list[list[str]] = []
     for rank, row in enumerate(aggregate_rows, start=1):
         cells = [
@@ -418,33 +518,33 @@ def _print_report(
             str(row["algorithm"]),
             str(row.get("variant_label") or "-"),
             str(row["design_count"]),
-            f"{float(row['weighted_cost']):.6f}",
-            f"{float(row['final_score']):.4f}",
+            f"{float(row['final_score']):.6f}",
         ]
         for metric_name in metrics:
             cells.append(_format_optional_float(row[f"avg_{metric_name}"]))
-            cells.append(_format_optional_float(row[f"avg_norm_{metric_name}"]))
+            cells.append(_format_optional_float(row[f"avg_{metric_name}_rank"]))
+            cells.append(_format_optional_float(row[f"avg_{metric_name}_score"]))
         aggregate_rows_text.append(cells)
     print()
     print(_format_table(aggregate_headers, aggregate_rows_text))
 
-    detail_headers = ["design", "algorithm", "variant_label", "weighted_cost", "final_score", "active_weight_sum"]
+    detail_headers = ["design", "rank", "algorithm", "variant_label", "final_score", "active_weight_sum"]
     for metric_name in metrics:
-        detail_headers.extend((metric_name, f"max_{metric_name}", f"norm_{metric_name}"))
+        detail_headers.extend((metric_name, f"{metric_name}_rank", f"{metric_name}_score"))
     detail_rows_text: list[list[str]] = []
     for row in detail_rows:
         cells = [
             str(row["design"]),
+            str(row["rank"]),
             str(row["algorithm"]),
             str(row.get("variant_label") or "-"),
-            f"{float(row['weighted_cost']):.6f}",
-            f"{float(row['final_score']):.4f}",
+            f"{float(row['final_score']):.6f}",
             f"{float(row['active_weight_sum']):.3f}",
         ]
         for metric_name in metrics:
             cells.append(_format_optional_float(row[metric_name]))
-            cells.append(_format_optional_float(row[f"max_{metric_name}"]))
-            cells.append(_format_optional_float(row[f"norm_{metric_name}"]))
+            cells.append(_format_optional_float(row[f"{metric_name}_rank"]))
+            cells.append(_format_optional_float(row[f"{metric_name}_score"]))
         detail_rows_text.append(cells)
     print()
     print(_format_table(detail_headers, detail_rows_text))
@@ -455,7 +555,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     specs = _parse_summary_specs(args.summary)
-    loaded = [load_summary(spec) for spec in specs]
+    loaded = [summary for spec in specs for summary in load_summaries(spec)]
     weights = {
         "and": args.and_weight,
         "lev": args.lev_weight,

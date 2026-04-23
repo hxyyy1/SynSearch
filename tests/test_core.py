@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from alphasyn.backend import immediate_reward, parse_abc_and_count, parse_abc_stats
+from alphasyn.backend import ABCBackend, immediate_reward, parse_abc_and_count, parse_abc_stats
 from alphasyn.mcts import run_search
 from alphasyn.types import BackendResult, BaselineInfo, SearchConfig, format_sequence_for_abc
 
@@ -118,6 +120,61 @@ class CoreTests(unittest.TestCase):
         self.assertIn("nodes", payload["steps"][0]["iteration_traces"][0])
         self.assertEqual(payload["sequence"], "rewrite; balance")
         self.assertEqual(format_sequence_for_abc(result.sequence), "rewrite; balance")
+
+    def test_backend_skips_peak_memory_collection_by_default(self) -> None:
+        test_workdir = Path.cwd() / ".test_artifacts" / "test_backend_skips_peak_memory_collection_by_default"
+        if test_workdir.exists():
+            shutil.rmtree(test_workdir)
+        test_workdir.mkdir(parents=True, exist_ok=True)
+        backend = ABCBackend("abc", test_workdir)
+        completed = subprocess.CompletedProcess(
+            ["abc", "-c", "print_stats"],
+            0,
+            stdout="and = 42 lev = 9\n",
+            stderr="",
+        )
+        try:
+            with patch("alphasyn.backend.subprocess.run", return_value=completed) as run_mock:
+                result = backend._run_and_cache(
+                    key="demo",
+                    read_command="read_blif /tmp/demo.blif",
+                    commands=("strash",),
+                )
+            self.assertEqual(result.and_count, 42)
+            self.assertEqual(result.lev_count, 9)
+            self.assertIsNone(result.peak_memory_kb)
+            run_mock.assert_called_once()
+        finally:
+            backend.cleanup_cache()
+            shutil.rmtree(test_workdir, ignore_errors=True)
+
+    def test_backend_ignores_legacy_peak_memory_flag(self) -> None:
+        test_workdir = Path.cwd() / ".test_artifacts" / "test_backend_ignores_legacy_peak_memory_flag"
+        if test_workdir.exists():
+            shutil.rmtree(test_workdir)
+        test_workdir.mkdir(parents=True, exist_ok=True)
+        backend = ABCBackend("abc", test_workdir)
+        completed = subprocess.CompletedProcess(
+            ["abc", "-c", "print_stats"],
+            0,
+            stdout="and = 30 lev = 7\n",
+            stderr="",
+        )
+        try:
+            with patch("alphasyn.backend.subprocess.run", return_value=completed) as run_mock:
+                result = backend._run_and_cache(
+                    key="demo",
+                    read_command="read_blif /tmp/demo.blif",
+                    commands=("strash",),
+                )
+            self.assertEqual(result.and_count, 30)
+            self.assertEqual(result.lev_count, 7)
+            self.assertIsNone(result.peak_memory_kb)
+            self.assertIsNone(backend.get_peak_memory_kb())
+            run_mock.assert_called_once()
+        finally:
+            backend.cleanup_cache()
+            shutil.rmtree(test_workdir, ignore_errors=True)
 
 
 if __name__ == "__main__":

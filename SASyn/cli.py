@@ -5,12 +5,26 @@ import csv
 import json
 import os
 import re
+import sys
 from pathlib import Path
+
+from external_monitoring import (
+    is_external_monitor_active,
+    remove_flag,
+    run_under_external_monitor,
+    upsert_option,
+)
 
 from .backend import ABCBackend, BackendError
 from .dataset import discover_blif_designs, write_manifest
 from .sa import run_search
-from .core_types import SearchConfig, SearchResult, format_sequence_for_abc
+from .core_types import (
+    ACTION_TO_ABC_COMMAND,
+    DEFAULT_ACTION_SPACE,
+    SearchConfig,
+    SearchResult,
+    format_sequence_for_abc,
+)
 
 
 def _resolve_local_path(path: Path) -> Path:
@@ -30,6 +44,21 @@ def _discover_designs_or_exit(dataset_root: Path) -> dict[str, Path]:
         return discover_blif_designs(dataset_root)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
+
+
+def _parse_action_space(raw_actions: str | None) -> tuple[str, ...]:
+    if raw_actions is None:
+        return DEFAULT_ACTION_SPACE
+    parsed = tuple(item.strip() for item in raw_actions.split(",") if item.strip())
+    if not parsed:
+        raise SystemExit("--actions must contain at least one action.")
+    unknown = [item for item in parsed if item not in ACTION_TO_ABC_COMMAND]
+    if unknown:
+        available = ", ".join(sorted(ACTION_TO_ABC_COMMAND))
+        raise SystemExit(
+            f"Unknown action(s) in --actions: {', '.join(unknown)}. Available actions: {available}"
+        )
+    return parsed
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -57,6 +86,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--min-temperature", type=float, default=1e-3)
     run.add_argument("--seed", type=int, default=0)
+    run.add_argument("--actions", default=None, help="Comma-separated action labels to search.")
+    run.add_argument(
+        "--external-monitor",
+        action="store_true",
+        help="Run each selected design under the external monitor and patch result JSON metrics.",
+    )
     run.add_argument("--debug-search", action="store_true")
 
     summarize = subparsers.add_parser("summarize", help="Aggregate JSON search results into CSV.")
@@ -111,37 +146,40 @@ def _command_run_search(args: argparse.Namespace) -> int:
     backend = ABCBackend(args.abc_bin, args.workdir)
     results_dir = args.workdir / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
-
-    for design_name, design_path in selected.items():
-        config = SearchConfig(
-            design_name=design_name,
-            design_path=design_path,
-            sequence_length=args.sequence_length,
-            search_iterations=args.search_iterations,
-            and_weight=args.and_weight,
-            lev_weight=args.lev_weight,
-            initial_temperature=args.initial_temperature,
-            min_temperature=args.min_temperature,
-            seed=args.seed,
-            debug_search=args.debug_search,
-            workdir=args.workdir,
-        )
-        result = run_search(config, backend)
-        result_stem = _result_file_stem(design_name)
-        output_path = results_dir / f"{result_stem}.json"
-        output_path.write_text(json.dumps(result.to_json_dict(), indent=2), encoding="ascii")
-        debug_csv_path = None
-        if args.debug_search:
-            debug_csv_path = results_dir / f"{result_stem}.debug.csv"
-            _write_debug_csv(result, debug_csv_path)
-        print(f"design: {design_name}")
-        print(f"final_and: {result.final_and_count}")
-        print(f"final_lev: {result.final_lev_count}")
-        print(f"sequence: {format_sequence_for_abc(result.sequence)}")
-        print(f"output_json: {output_path}")
-        if args.debug_search:
-            print(f"output_debug_csv: {debug_csv_path}")
-    return 0
+    try:
+        for design_name, design_path in selected.items():
+            config = SearchConfig(
+                design_name=design_name,
+                design_path=design_path,
+                action_space=_parse_action_space(args.actions),
+                sequence_length=args.sequence_length,
+                search_iterations=args.search_iterations,
+                and_weight=args.and_weight,
+                lev_weight=args.lev_weight,
+                initial_temperature=args.initial_temperature,
+                min_temperature=args.min_temperature,
+                seed=args.seed,
+                debug_search=args.debug_search,
+                workdir=args.workdir,
+            )
+            result = run_search(config, backend)
+            result_stem = _result_file_stem(design_name)
+            output_path = results_dir / f"{result_stem}.json"
+            output_path.write_text(json.dumps(result.to_json_dict(), indent=2), encoding="ascii")
+            debug_csv_path = None
+            if args.debug_search:
+                debug_csv_path = results_dir / f"{result_stem}.debug.csv"
+                _write_debug_csv(result, debug_csv_path)
+            print(f"design: {design_name}")
+            print(f"final_and: {result.final_and_count}")
+            print(f"final_lev: {result.final_lev_count}")
+            print(f"sequence: {format_sequence_for_abc(result.sequence)}")
+            print(f"output_json: {output_path}")
+            if args.debug_search:
+                print(f"output_debug_csv: {debug_csv_path}")
+        return 0
+    finally:
+        backend.cleanup_base_aig()
 
 
 def _write_debug_csv(result: SearchResult, output_path: Path) -> None:
@@ -257,14 +295,38 @@ def _command_summarize(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_with_external_monitor(args: argparse.Namespace, raw_argv: list[str]) -> int | None:
+    if is_external_monitor_active() or not args.external_monitor:
+        return None
+    args.workdir = _resolve_local_path(args.workdir)
+    base_argv = remove_flag(raw_argv, "--external-monitor")
+    designs = _discover_designs_or_exit(args.dataset_root)
+    selected_designs = [args.design] if args.design else sorted(designs)
+    for design_name in selected_designs:
+        patch_json = args.workdir / "results" / f"{_result_file_stem(design_name)}.json"
+        design_argv = upsert_option(base_argv, "--design", design_name)
+        exit_code = run_under_external_monitor(
+            raw_argv=design_argv,
+            patch_json=patch_json,
+            module_name="SASyn",
+        )
+        if exit_code != 0:
+            return exit_code
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = _build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw_argv)
 
     try:
         if args.command == "prepare-data":
             return _command_prepare_data(args)
         if args.command == "run-search":
+            monitored = _run_with_external_monitor(args, raw_argv)
+            if monitored is not None:
+                return monitored
             return _command_run_search(args)
         if args.command == "summarize":
             return _command_summarize(args)

@@ -22,7 +22,12 @@ import sys
 import time
 from typing import Dict, List, Optional, Tuple
 
-from memory_utils import run_command_with_peak_memory
+from external_monitoring import (
+    is_external_monitor_active,
+    remove_flag,
+    run_under_external_monitor,
+    upsert_option,
+)
 
 from . import result_utils, summarize_results
 
@@ -58,7 +63,7 @@ AND_REWARD_WEIGHT = 0.5
 LEV_REWARD_WEIGHT = 0.2
 
 # 随机种子（用于并列时随机打破平局）
-RANDOM_SEED = 2
+RANDOM_SEED = 0
 
 
 def natural_sort_key(text: str) -> List[object]:
@@ -81,7 +86,7 @@ def parse_optional_kv_args(args: List[str]) -> Dict[str, str]:
     - --key value
     - --flag
     """
-    boolean_flags = {"debug-search", "debug"}
+    boolean_flags = {"debug-search", "debug", "external-monitor"}
     kv: Dict[str, str] = {}
     i = 0
     while i < len(args):
@@ -142,12 +147,14 @@ def run_abc_command(
         abc_bin = ABC_BIN
 
     try:
-        completed, peak_memory_kb = run_command_with_peak_memory(
+        completed = subprocess.run(
             [abc_bin, "-c", abc_cmd],
+            capture_output=True,
             text=True,
             timeout=timeout_sec,
             check=False,
         )
+        peak_memory_kb = None
         success = completed.returncode == 0
         return success, completed.stdout or "", completed.stderr or "", peak_memory_kb
 
@@ -201,6 +208,11 @@ def parse_abc_stats(abc_output_string: str) -> Tuple[Optional[int], Optional[int
     return nodes, level
 
 
+def _signed_sqrt_reward(previous_value: int, current_value: int, baseline: float) -> float:
+    reward = math.sqrt(abs(previous_value - current_value) / baseline)
+    return reward if previous_value > current_value else -reward
+
+
 def compute_reward(
     old_nodes: int,
     new_nodes: Optional[int],
@@ -228,24 +240,68 @@ def compute_reward(
 
     normalized_and_weight = and_reward_weight / weight_sum
     normalized_lev_weight = lev_reward_weight / weight_sum
-    and_gain = float(old_nodes - new_nodes) / max(old_nodes, 1)
-    lev_gain = float(old_level - new_level) / max(old_level, 1)
+    and_gain = _signed_sqrt_reward(old_nodes, new_nodes, max(old_nodes, 1))
+    lev_gain = _signed_sqrt_reward(old_level, new_level, max(old_level, 1))
     return (normalized_and_weight * and_gain) + (normalized_lev_weight * lev_gain)
 
 
+def compute_weighted_result_cost(
+    reference_nodes: int,
+    candidate_nodes: int,
+    reference_level: Optional[int],
+    candidate_level: Optional[int],
+    and_reward_weight: float = AND_REWARD_WEIGHT,
+    lev_reward_weight: float = LEV_REWARD_WEIGHT,
+) -> Optional[float]:
+    """Lower cost is better and matches the weighted objective used by reward."""
+    if reference_level is None or candidate_level is None:
+        return None
+
+    weight_sum = and_reward_weight + lev_reward_weight
+    if weight_sum <= 0:
+        raise ValueError("and_reward_weight + lev_reward_weight must be positive")
+
+    normalized_and_weight = and_reward_weight / weight_sum
+    normalized_lev_weight = lev_reward_weight / weight_sum
+    return (
+        normalized_and_weight * (float(candidate_nodes) / max(reference_nodes, 1))
+        + normalized_lev_weight * (float(candidate_level) / max(reference_level, 1))
+    )
+
+
 def is_better_result(
+    reference_nodes: int,
+    reference_level: Optional[int],
     candidate_nodes: int,
     candidate_level: Optional[int],
     incumbent_nodes: int,
     incumbent_level: Optional[int],
+    and_reward_weight: float = AND_REWARD_WEIGHT,
+    lev_reward_weight: float = LEV_REWARD_WEIGHT,
 ) -> bool:
-    if candidate_nodes != incumbent_nodes:
-        return candidate_nodes < incumbent_nodes
-    if candidate_level is None:
+    candidate_cost = compute_weighted_result_cost(
+        reference_nodes=reference_nodes,
+        candidate_nodes=candidate_nodes,
+        reference_level=reference_level,
+        candidate_level=candidate_level,
+        and_reward_weight=and_reward_weight,
+        lev_reward_weight=lev_reward_weight,
+    )
+    incumbent_cost = compute_weighted_result_cost(
+        reference_nodes=reference_nodes,
+        candidate_nodes=incumbent_nodes,
+        reference_level=reference_level,
+        candidate_level=incumbent_level,
+        and_reward_weight=and_reward_weight,
+        lev_reward_weight=lev_reward_weight,
+    )
+
+    if candidate_cost is None:
         return False
-    if incumbent_level is None:
+    if incumbent_cost is None:
         return True
-    return candidate_level < incumbent_level
+    if candidate_cost != incumbent_cost:
+        return candidate_cost < incumbent_cost
 
 
 # ------------------------------
@@ -257,7 +313,7 @@ class UCBBandit:
     def __init__(
         self,
         action_list: List[str],
-        c: float = 2.0,
+        c: float = 0.4,
         rng: Optional[random.Random] = None,
     ):
         self.actions = list(action_list)
@@ -337,7 +393,11 @@ def evaluate_sequence(
     abc_bin: Optional[str] = None,
 ) -> Tuple[bool, Optional[int], Optional[int], str, float | None]:
     """执行命令序列并返回 (success, nodes, level, raw_output, peak_memory_kb)"""
-    success, stdout, stderr, peak_memory_kb = run_abc_command(blif_path, seq, abc_bin=abc_bin)
+    success, stdout, stderr, peak_memory_kb = run_abc_command(
+        blif_path,
+        seq,
+        abc_bin=abc_bin,
+    )
 
     # ABC 的统计通常在 stdout；少数情况下可能输出到 stderr，统一拼接解析
     combined = "\n".join([stdout, stderr]).strip()
@@ -527,7 +587,16 @@ def optimize_one_benchmark(
         # logging.info(bandit.q_values)
 
         # 更新全局最优
-        if is_better_result(current_nodes, current_level, best_nodes, best_level):
+        if is_better_result(
+            reference_nodes=init_nodes,
+            reference_level=init_level,
+            candidate_nodes=current_nodes,
+            candidate_level=current_level,
+            incumbent_nodes=best_nodes,
+            incumbent_level=best_level,
+            and_reward_weight=AND_REWARD_WEIGHT,
+            lev_reward_weight=LEV_REWARD_WEIGHT,
+        ):
             best_nodes = current_nodes
             best_level = current_level
             best_recipe = list(current_seq)
@@ -804,6 +873,11 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--actions", default=None)
     run.add_argument("--result-json", type=Path, default=None)
     run.add_argument("--log-level", default="INFO")
+    run.add_argument(
+        "--external-monitor",
+        action="store_true",
+        help="Run each selected design under the external monitor and patch result JSON metrics.",
+    )
     run.add_argument("--debug-search", action="store_true")
 
     summarize = subparsers.add_parser("summarize", help="Aggregate JSON search results into CSV.")
@@ -901,8 +975,32 @@ def _command_summarize(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = _build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw_argv)
+    if (
+        args.command == "run-search"
+        and args.external_monitor
+        and not is_external_monitor_active()
+    ):
+        args.workdir = _resolve_local_path(args.workdir)
+        result_utils.set_workdir(str(args.workdir))
+        base_argv = remove_flag(raw_argv, "--external-monitor")
+        designs = _discover_designs_or_exit(args.dataset_root)
+        selected_designs = [args.design] if args.design else sorted(designs, key=natural_sort_key)
+        for design_name in selected_designs:
+            patch_json = Path(
+                result_utils.get_method_results_dir("baseline_mab")
+            ) / result_utils.benchmark_to_result_filename(design_name)
+            design_argv = upsert_option(base_argv, "--design", design_name)
+            exit_code = run_under_external_monitor(
+                raw_argv=design_argv,
+                patch_json=patch_json,
+                module_name="MABSyn.baseline_mab",
+            )
+            if exit_code != 0:
+                return exit_code
+        return 0
     if args.command == "run-search":
         return _command_run_search(args)
     if args.command == "summarize":
