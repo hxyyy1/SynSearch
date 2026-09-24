@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -14,7 +15,7 @@ class SummarySpec:
 
 
 DEFAULT_SUMMARIES = (
-    SummarySpec("MCTSyn", Path(".alphasyn_work/summary.csv")),
+    SummarySpec("AlphaSyn", Path(".alphasyn_work/summary.csv")),
     SummarySpec("HybridSyn", Path(".hybridsyn_work/summary.csv")),
     SummarySpec("SASyn", Path(".sasyn_work/summary.csv")),
     SummarySpec("MABSyn-UCB1", Path(".mabsyn_work/results/baseline_mab/summary.csv")),
@@ -44,8 +45,7 @@ class LoadedSummary:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Compare algorithm summaries by normalizing each metric with the per-design "
-            "maximum across algorithms, then aggregating with weighted sums."
+            "Compare algorithm summaries using weighted per-design metric rank scores."
         )
     )
     parser.add_argument(
@@ -55,14 +55,14 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="NAME=PATH",
         help=(
             "Algorithm summary to compare. Can be passed multiple times. "
-            "Default: MCTSyn/HybridSyn/SASyn/MABSyn-UCB1/MABSyn-UCB1Prefix project summaries."
+            "Default: AlphaSyn/HybridSyn/SASyn/MABSyn-UCB1/MABSyn-UCB1Prefix project summaries."
         ),
     )
     parser.add_argument(
         "--missing-policy",
         choices=("common", "error"),
         default="common",
-        help="How to handle designs not shared by every summary.",
+        help="Compare available results per design, or require identical design coverage.",
     )
     parser.add_argument("--and-weight", type=float, default=0.5)
     parser.add_argument("--lev-weight", type=float, default=0.2)
@@ -78,7 +78,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--details-output",
         type=Path,
         default=DEFAULT_DETAILS_OUTPUT,
-        help="CSV path for per-design normalized details.",
+        help="CSV path for per-design metric ranks and scores.",
     )
     parser.add_argument(
         "--print-report",
@@ -368,7 +368,7 @@ def compare_summaries(
                 metric_name: metric_rankings[metric_name][summary_key][0]
                 for metric_name in design_metrics
             }
-            final_score = sum(
+            final_score = math.fsum(
                 weights[metric_name] * metric_scores[metric_name]
                 for metric_name in design_metrics
             )
@@ -417,7 +417,7 @@ def compare_summaries(
             "algorithm": summary.spec.name,
             "variant_label": summary.variant_label,
             "design_count": len(algorithm_scores),
-            "final_score": sum(float(item["final_score"]) for item in algorithm_scores),
+            "final_score": math.fsum(float(item["final_score"]) for item in algorithm_scores),
             "summary_path": str(summary.spec.path),
         }
         for metric_name in metrics:

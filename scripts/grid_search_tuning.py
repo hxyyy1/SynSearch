@@ -90,7 +90,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=list(ALGORITHMS),
         help="Algorithms to tune.",
     )
-    parser.add_argument("--dataset-root", type=Path, default=Path("tc_public"))
+    parser.add_argument("--dataset-root", type=Path, default=Path("benchmarks"))
     parser.add_argument(
         "--design",
         action="append",

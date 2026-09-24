@@ -1,460 +1,213 @@
-# MCTSyn
+# SynSearch
 
-`MCTSyn` 现在在同一个仓库中包含四种 BLIF 逻辑综合搜索实现：
+**Search-based Logic Synthesis with ABC**
 
-- `alphasyn`：MCTS 流程
-- `hybridsyn`：UCB1 预热启动加 MCTS 续搜
-- `SASyn`：模拟退火流程
-- `MABSyn`：基于 UCB1 和 LinUCB 的多臂老虎机基线方法
+SynSearch 是一个面向 BLIF 电路的逻辑综合序列搜索工具集。它通过 ABC 执行综合命令，用 MCTS、UCB1、LinUCB 和模拟退火探索命令序列，记录 AIG 节点数（`and`）、逻辑层级（`lev`）及搜索过程，支持在同一组 benchmark 上比较不同搜索方法。
 
-所有实现都以 `ABC` 为目标。`alphasyn`、`hybridsyn` 和 `SASyn` 复用仓库中已有的 `tc_public/` 与 `benchmarks/` 目录，而 `MABSyn` 复用仓库中已有的 `tc_public/` 目录。各算法彼此独立：纯 MCTS 路径位于 `alphasyn/`，混合 UCB1+MCTS 路径位于 `hybridsyn/`，模拟退火路径位于 `SASyn/`，而 bandit 方法位于 `MABSyn/`。
+## 搜索方法
 
-## 共享范围
+| 方法 | Python 模块 | 搜索方式 |
+| --- | --- | --- |
+| AlphaSyn | `alphasyn` | 逐步 MCTS，支持树复用，无神经网络 |
+| HybridSyn | `hybridsyn` | UCB1 确定前期前缀，MCTS 完成后续搜索 |
+| SASyn | `SASyn` | 对完整命令序列进行模拟退火 |
+| UCB1 | `MABSyn.baseline_mab` | 全局 Bandit 序列搜索 |
+| UCB1 Prefix | `MABSyn.baseline_mab_prefix` | 按步骤使用 Bandit，缓存前缀 AIG |
+| LinUCB | `MABSyn.linucb` | 使用电路状态特征的上下文 Bandit |
 
-- `--dataset-root` 指向包含目标 `.blif` 文件的目录
-- 数据集扫描是递归的，因此支持 `benchmarks/VTR`、`benchmarks/EPFL` 或嵌套的 `tc_public/*` 等目录布局
-- 如果同一个 dataset root 下存在重名文件，CLI 会自动使用诸如 `tc_public_1/input.blif` 这样的相对路径作为 design 名称
-- 后端仅支持 `ABC`
-- 动作空间固定为 `balance`、`rewrite`、`rewrite-z`、`refactor`、`refactor-z`、`resub`、`resub-z`
+## 环境准备
 
-将 `ABC` 加入 `PATH`，或者显式传入 `--abc-bin`：
+- Python 3.10 或更高版本。
+- 可执行的 ABC 逻辑综合工具，需支持 `read_blif`、`strash` 及所选综合命令。
+- NumPy：LinUCB 和完整测试套件需要，其他搜索方法仅使用 Python 标准库。
+- 外部资源监控使用 GNU `time`；建议在 Linux 上运行。
+
+在仓库根目录执行：
 
 ```bash
-export PATH="$HOME/abc:$PATH"
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
+
+# 替换为本机 ABC 可执行文件的绝对路径；若 abc 已在 PATH 中则可省略。
+export ABC_BIN=/path/to/abc
+"$ABC_BIN" -c 'version'
 ```
 
-## `alphasyn`（MCTS）
+也可以在搜索命令中使用 `--abc-bin /path/to/abc`。以下命令均从仓库根目录运行。
 
-`alphasyn` 保留了原始 MCTSyn 的行为：逐步执行的 MCTS，使用 `Q + R + U` 进行选择，在根节点使用 `Q + R` 选择动作，支持树复用，不使用神经网络，不注入固定子序列，不使用资源分配器，也不进行并行搜索。
+## 电路数据集
 
-准备数据集清单：
+所有搜索入口、网格搜索和静态动作评估默认递归扫描 `benchmarks/`，仅读取 `.blif` 文件。
+
+| 目录 | BLIF 电路数量 | 说明 |
+| --- | ---: | --- |
+| `benchmarks/EPFL/` | 20 | EPFL 电路；同目录还保留 AIG、Verilog 和 VHDL 表示 |
+| `benchmarks/VTR/` | 6 | VTR 电路，文件名形如 `bfly.abc.blif` |
+
+使用 `--dataset-root benchmarks/EPFL` 或 `--dataset-root benchmarks/VTR` 可以选择单个子集。所有算法使用一致的电路名称：文件名唯一时使用文件名（如 `adder.blif`），重名时使用相对于数据集根目录的路径。省略 `--design` 会运行选定目录中的全部 BLIF 电路。
+
+生成包含文件路径和 SHA-256 的数据清单，不需要 ABC：
 
 ```bash
-python -m alphasyn prepare-data
-python -m alphasyn prepare-data --dataset-root benchmarks/VTR
+python3 -m alphasyn prepare-data
+# 其他支持该命令的入口：hybridsyn、SASyn
 ```
 
-运行核心搜索：
+清单默认位于 `.alphasyn_work/manifest.json`。搜索命令也可以直接运行，无需先生成清单。
+
+## 快速开始
+
+在 EPFL 的 `adder.blif` 上运行一个小预算 MCTS 搜索，并汇总结果：
 
 ```bash
-python -m alphasyn run-search --abc-bin /path/to/abc --search-iterations 64 --sequence-length 24
-python -m alphasyn run-search --dataset-root tc_public --design tc_public_1/input.blif --sequence-length 10 --search-iterations 10
-python -m alphasyn run-search --dataset-root tc_public --sequence-length 10 --search-iterations 10 --external-monitor
-python -m alphasyn run-search --dataset-root tc_public --sequence-length 10 --search-iterations 10 --cpuct 1.0
-python -m alphasyn run-search --dataset-root benchmarks/VTR --design bfly.abc.blif --sequence-length 10 --search-iterations 20
-python -m alphasyn run-search --dataset-root benchmarks/VTR --sequence-length 10 --search-iterations 30 --cpuct 1.0
-python -m alphasyn run-search --dataset-root benchmarks/VTR --design bfly.abc.blif --debug-search
+python3 -m alphasyn run-search \
+  --design adder.blif \
+  --sequence-length 4 \
+  --search-iterations 4 \
+  --seed 0 \
+  --external-monitor
+
+python3 -m alphasyn summarize
 ```
 
-将 JSON 结果汇总为 CSV：
+结果 JSON 位于 `.alphasyn_work/results/`，CSV 位于 `.alphasyn_work/summary.csv`。JSON 包含搜索序列、最终电路指标和搜索配置。上述预算用于验证流程，实际优化时可增加序列长度与迭代次数。
+
+运行完整 VTR 子集：
 
 ```bash
-python -m alphasyn summarize
+python3 -m alphasyn run-search \
+  --dataset-root benchmarks/VTR \
+  --sequence-length 10 --search-iterations 20 --external-monitor
 ```
 
-常用参数：
+## 运行其他方法
 
-- `--dataset-root benchmarks/VTR`：选择要扫描的具体文件夹
-- `--design bfly.abc.blif`：选择该文件夹下某一个精确的 `.blif` 文件名；省略时会运行该文件夹树中的全部文件
-- `--debug-search`：将每一步根节点动作的 `Q/R/U/visits` 保存到 `steps[*].action_debug`，将每次迭代的节点轨迹保存到 `steps[*].iteration_traces`，并在 JSON 同目录输出调试 CSV 文件
-- `--abc-bin /home/hxy/abc/abc`：显式指定 `ABC` 路径；如果 `abc` 已在 `PATH` 中可省略
-- `--sequence-length 24`：搜索序列长度
-- `--search-iterations 64`：每一步的 MCTS 迭代次数
-- `--cpuct 1.0`：`U` 项的探索强度
-- `--mu-discount 0.9`：回传时使用的长期折扣
-- `--seed 0`：随机种子
-- `--actions balance,rewrite,rewrite-z,refactor,refactor-z,resub,resub-z`：覆盖默认搜索动作空间；额外支持的标签包括 `fraig`、`fx`、`mfs`、`dsd`、`dch`、`extract` 和 `collapse`
-- `--external-monitor`：将每个 design 作为受外部监控的子进程运行，并把 `runtime` / `peak_memory` 回填到结果 JSON 中
-- `--workdir .alphasyn_work`：输出目录；必须位于当前项目目录内
-
-输出：
-
-- 默认输出目录为 `.alphasyn_work/`
-- `results/*.json` 存储详细搜索结果
-- 启用 `--debug-search` 时，`results/*.debug.csv` 按 `(step, action)` 存储每一行
-- 启用 `--debug-search` 时，`results/*.trace.csv` 按 `(step, iteration, node, action)` 存储每一行
-- `cache/` 会按每次 `run-search` 调用分别命名空间隔离，并在该次运行结束后自动删除
-- `summary.csv` 为每个 design 存储一行，用于对比 `resyn2` 启发式结果与 MCTS 结果
-
-## `hybridsyn`（UCB1 预热启动 + MCTS）
-
-`hybridsyn` 会先执行逐步式的 `UCB1` 预热启动，以确定前期前缀，然后把该前缀交给 `alphasyn` 风格的 MCTS 核心来完成剩余搜索步骤。
-
-准备数据集清单：
+下列示例使用相同的 `adder.blif`，方便生成可比较的结果。
 
 ```bash
-python -m hybridsyn prepare-data
-python -m hybridsyn prepare-data --dataset-root benchmarks/VTR
+# UCB1 预热 + MCTS
+python3 -m hybridsyn run-search --design adder.blif \
+  --sequence-length 10 --warmup-steps 3 --warmup-episodes 20 \
+  --search-iterations 20 --seed 0 --external-monitor
+python3 -m hybridsyn summarize
+
+# 模拟退火
+python3 -m SASyn run-search --design adder.blif \
+  --sequence-length 10 --search-iterations 100 --seed 0 --external-monitor
+python3 -m SASyn summarize
+
+# 全局 UCB1
+python3 -m MABSyn.baseline_mab run-search --design adder.blif \
+  --steps 10 --episodes 20 --ucb-c 1.0 --seed 0 --external-monitor
+python3 -m MABSyn.baseline_mab summarize
+
+# 带前缀缓存的 UCB1
+python3 -m MABSyn.baseline_mab_prefix run-search --design adder.blif \
+  --steps 10 --episodes 20 --ucb-c 0.4 --seed 0 --external-monitor
+python3 -m MABSyn.baseline_mab_prefix summarize
+
+# 上下文 LinUCB
+python3 -m MABSyn.linucb run-search --design adder.blif \
+  --steps 10 --episodes 20 --seed 0 --external-monitor
+python3 -m MABSyn.linucb summarize
 ```
 
-运行混合搜索：
+### 参数与目标
+
+- `--dataset-root`、`--design`、`--abc-bin`、`--seed`、`--workdir` 和 `--external-monitor` 适用于所有搜索入口。
+- AlphaSyn / HybridSyn 的 `--search-iterations` 是每一步的 MCTS 迭代数；SASyn 中它是总退火迭代数。Bandit 方法使用 `--steps` 和 `--episodes`。不同方法的相同数值不代表相同计算预算。
+- AlphaSyn 使用 `--cpuct` 控制探索强度、`--mu-discount` 控制长期回报折扣；HybridSyn 还提供 `--warmup-steps`、`--warmup-episodes`、`--warmup-top-k` 和 `--ucb-c`。
+- SASyn 默认代价为 `0.7 × and/initial_and + 0.3 × lev/initial_lev`，可通过 `--and-weight`、`--lev-weight` 和温度参数调整。
+- LinUCB 提供 `--alpha`、`--lambda`、`--long-term-rollouts` 和 `--long-term-horizon` 等参数。
+- AlphaSyn、HybridSyn、SASyn 和全局 UCB1 支持 `--debug-search`，用于导出更详细的搜索轨迹。
+
+默认动作包括 `balance`、`rewrite`、`rewrite -z`、`refactor`、`refactor -z`、`resub` 和 `resub -z`。自定义动作示例：
 
 ```bash
-python -m hybridsyn run-search --abc-bin /path/to/abc --sequence-length 24 --warmup-steps 4 --search-iterations 64
-python -m hybridsyn run-search --dataset-root tc_public --design tc_public_1/input.blif --sequence-length 10 --warmup-steps 3 --warmup-episodes 20 --search-iterations 10
-python -m hybridsyn run-search --dataset-root tc_public --sequence-length 10 --warmup-steps 3 --warmup-episodes 20 --search-iterations 10 --external-monitor
-python -m hybridsyn run-search --dataset-root tc_public --sequence-length 10 --warmup-steps 4 --search-iterations 30 --ucb-c 0.4 --cpuct 1.0
-python -m hybridsyn run-search --dataset-root benchmarks/VTR --sequence-length 10 --warmup-steps 4 --warmup-episodes 20 --search-iterations 30 --warmup-top-k 3
-python -m hybridsyn run-search --dataset-root benchmarks/VTR --design bfly.abc.blif --sequence-length 10 --warmup-steps 4 --search-iterations 20 --debug-search
+# AlphaSyn / HybridSyn / SASyn 使用动作标签
+python3 -m alphasyn run-search --design adder.blif \
+  --actions balance,rewrite,rewrite-z --sequence-length 4 --search-iterations 4
+
+# MABSyn 的 --actions 接受 ABC 命令字符串
+python3 -m MABSyn.baseline_mab run-search --design adder.blif \
+  --actions 'balance,rewrite,rewrite -z' --steps 4 --episodes 4
 ```
 
-将 JSON 结果汇总为 CSV：
+完整参数以各模块的 `run-search --help` 为准。
+
+## 结果与比较
+
+| 方法 | 默认汇总 CSV |
+| --- | --- |
+| AlphaSyn | `.alphasyn_work/summary.csv` |
+| HybridSyn | `.hybridsyn_work/summary.csv` |
+| SASyn | `.sasyn_work/summary.csv` |
+| UCB1 | `.mabsyn_work/results/baseline_mab/summary.csv` |
+| UCB1 Prefix | `.mabsyn_work/results/baseline_mab_prefix/summary.csv` |
+| LinUCB | `.mabsyn_work/results/linucb/summary.csv` |
+
+`--external-monitor` 为每个电路启动独立子进程，并回填运行时间和峰值内存。对比时间与内存时，各方法应使用相同的监控方式。`and` 和 `lev` 是 AIG 结构指标，不是工艺映射后的面积或物理时延。
+
+生成所需 CSV 后，可显式选择参与比较的方法：
 
 ```bash
-python -m hybridsyn summarize
+python3 compare_algorithm_summaries.py \
+  --summary AlphaSyn=.alphasyn_work/summary.csv \
+  --summary UCB1=.mabsyn_work/results/baseline_mab/summary.csv \
+  --summary LinUCB=.mabsyn_work/results/linucb/summary.csv \
+  --print-report
 ```
 
-常用参数：
+不传 `--summary` 时，脚本读取 AlphaSyn、HybridSyn、SASyn、UCB1 和 UCB1 Prefix 的五个默认汇总文件。默认按电路比较至少两个具有完整有效指标的结果；`--missing-policy error` 可要求电路集合完全一致。输出写入 `.compare_results/aggregate.csv` 和 `.compare_results/details.csv`。
 
-- `--dataset-root benchmarks/VTR`：选择要扫描的具体文件夹
-- `--design bfly.abc.blif`：选择该文件夹下某一个精确的 `.blif` 文件名；省略时会运行该文件夹树中的全部文件
-- `--abc-bin /home/hxy/abc/abc`：显式指定 `ABC` 路径；如果 `abc` 已在 `PATH` 中可省略
-- `--sequence-length 24`：总搜索序列长度
-- `--warmup-steps 4`：由 UCB1 负责的前期步骤数；超过序列长度的值会被截断
-- `--warmup-episodes 64`：UCB1 预热阶段的 episode 数；若省略则默认等于 `--search-iterations`
-- `--ucb-c 0.4`：UCB1 预热阶段的探索强度
-- `--search-iterations 64`：预热之后每一步的 MCTS 迭代次数
-- `--cpuct 1.0`：MCTS 中 `U` 项的探索强度
-- `--mu-discount 0.9`：MCTS 回传时使用的长期折扣
-- `--seed 0`：随机种子
-- `--actions balance,rewrite,rewrite-z,refactor,refactor-z,resub,resub-z`：覆盖默认搜索动作空间；额外支持的标签包括 `fraig`、`fx`、`mfs`、`dsd`、`dch`、`extract` 和 `collapse`
-- `--external-monitor`：将每个 design 作为受外部监控的子进程运行，并把 `runtime` / `peak_memory` 回填到结果 JSON 中
-- `--debug-search`：输出预热阶段 CSV 轨迹，以及 MCTS 调试 CSV 和迭代轨迹 CSV
-- `--workdir .hybridsyn_work`：输出目录；必须位于当前项目目录内
+评分根据每个电路上各指标的排名加权计算，默认权重为 AND 数 0.5、层级 0.2、时间 0.2、内存 0.1；总分越高越好。比较时应保持电路集合、ABC 版本和运行环境一致，并记录预算与随机种子。不同种子的汇总选择规则随方法而异，建议使用独立 `--workdir` 保存每次实验。
 
-输出：
+所有默认结果目录、缓存、测试产物和 `abc.history` 均由 `.gitignore` 排除。自定义 `--workdir` 必须位于当前工作目录内；如需保留多次实验，可使用默认工作目录下的子目录，并在 `summarize` 时传入同一 `--workdir`。
 
-- 默认输出目录为 `.hybridsyn_work/`
-- `results/*.json` 存储详细的混合搜索结果
-- 启用 `--debug-search` 时，`results/*.warmup.csv` 为 UCB1 预热阶段按 `(episode, step, action)` 存储每一行
-- 启用 `--debug-search` 时，`results/*.debug.csv` 为 MCTS 阶段按 `(step, action)` 存储每一行
-- 启用 `--debug-search` 时，`results/*.trace.csv` 为 MCTS 阶段按 `(step, iteration, node, action)` 存储每一行
-- `summary.csv` 为每个 design 存储一行，包含混合变体标签以及最终 `and` / `lev` 指标
+## 调优与动作评估
 
-## `SASyn`（模拟退火）
-
-`SASyn` 保留原始模拟退火行为：对完整序列进行搜索，最终归一化代价为
-`0.7 * (and / initial_and) + 0.3 * (lev / initial_lev)`.
-
-准备数据集清单：
+网格搜索支持 AlphaSyn、UCB1 和 UCB1 Prefix。每个参数组合使用独立工作目录，自动执行搜索、外部监控、汇总和比较：
 
 ```bash
-python -m SASyn prepare-data
-python -m SASyn prepare-data --dataset-root benchmarks/VTR
-```
-
-运行模拟退火搜索：
-
-```bash
-python -m SASyn run-search --dataset-root tc_public --design tc_public_1/input.blif --sequence-length 10 --search-iterations 1000
-python -m SASyn run-search --dataset-root tc_public --sequence-length 10 --search-iterations 1000 --external-monitor
-python -m SASyn run-search --dataset-root tc_public --sequence-length 10 --search-iterations 1000
-python -m SASyn run-search --dataset-root benchmarks/VTR --design bfly.abc.blif --search-iterations 2000 --debug-search
-```
-
-将 JSON 结果汇总为 CSV：
-
-```bash
-python -m SASyn summarize
-```
-
-常用参数：
-
-- `--dataset-root`：包含 `.blif` 文件的根目录
-- `--design`：运行 dataset root 下某一个精确 design；省略时会运行所有发现到的 design
-- `--sequence-length`：模拟退火使用的固定序列长度
-- `--search-iterations`：总退火迭代次数
-- `--and-weight`：最终代价中归一化 AND 数的权重
-- `--lev-weight`：最终代价中归一化层级数的权重
-- `--initial-temperature`：覆盖自动校准得到的初始温度
-- `--min-temperature`：几何降温调度的下界
-- `--seed`：随机种子
-- `--actions balance,rewrite,rewrite-z,refactor,refactor-z,resub,resub-z`：覆盖默认搜索动作空间；额外支持的标签包括 `fraig`、`fx`、`mfs`、`dsd`、`dch`、`extract` 和 `collapse`
-- `--external-monitor`：将每个 design 作为受外部监控的子进程运行，并把 `runtime` / `peak_memory` 回填到结果 JSON 中
-- `--debug-search`：输出逐迭代 CSV 轨迹
-- `--workdir .sasyn_work`：输出目录；必须位于当前项目目录内
-
-输出：
-
-- 默认输出目录为 `.sasyn_work/`
-- `manifest.json`：数据集清单
-- `base_aig/`：由输入 BLIF 文件生成的、按 design 区分的临时 AIG 起始点
-- `results/*.json`：按 design 存储的搜索结果
-- 启用 `--debug-search` 时，`results/*.debug.csv`：逐迭代轨迹
-- `summary.csv`：汇总报告
-
-每个 SA 结果 JSON 都包含：以 `ABC` 命令字符串表示的最终序列、最终 `and` 与 `lev`、从初始 design 和 `resyn2` 推导出的基线信息，以及位于 `iterations` 下的完整退火轨迹。
-
-## `MABSyn`（Bandit 基线方法）
-
-`MABSyn` 保留了三种 bandit 风格的基线方法：
-
-- `baseline_mab`：UCB1 序列搜索（一个 bandit）
-- `baseline_mab_prefix`：带前缀评估 AIG 缓存的 UCB1（每一步一个 bandit）
-- `linucb`：基于 LinUCB 的上下文 bandit 搜索
-
-它们现在都通过子命令调用，并默认将生成文件存放在 `.mabsyn_work/` 下。
-
-运行搜索：
-
-```bash
-python -m MABSyn.baseline_mab run-search --dataset-root tc_public --design tc_public_1/input.blif --episodes 20 --steps 10 --ucb-c 1.5 --debug-search
-python -m MABSyn.baseline_mab run-search --dataset-root tc_public --episodes 20 --steps 10 --ucb-c 1.5 --external-monitor
-python -m MABSyn.baseline_mab run-search --dataset-root benchmarks/VTR --design bfly.abc.blif --episodes 20 --steps 10
-python -m MABSyn.baseline_mab run-search --dataset-root tc_public --episodes 10 --steps 10
-python -m MABSyn.linucb run-search --dataset-root tc_public --design tc_public_1/input.blif --episodes 20 --steps 10
-python -m MABSyn.linucb run-search --dataset-root tc_public --episodes 20 --steps 10 --external-monitor
-python -m MABSyn.linucb run-search --dataset-root benchmarks/VTR --design bfly.abc.blif --episodes 20 --steps 10
-python -m MABSyn.linucb run-search --dataset-root tc_public --episodes 20 --steps 10
-python -m MABSyn.baseline_mab_prefix run-search --dataset-root tc_public --design tc_public_1/input.blif --episodes 20 --steps 10
-python -m MABSyn.baseline_mab_prefix run-search --dataset-root tc_public --episodes 20 --steps 10 --external-monitor
-python -m MABSyn.baseline_mab_prefix run-search --dataset-root benchmarks/VTR --design bfly.abc.blif --episodes 20 --steps 10
-```
-
-汇总：
-
-```bash
-python -m MABSyn.baseline_mab summarize
-python -m MABSyn.linucb summarize
-python -m MABSyn.baseline_mab_prefix summarize
-```
-
-常用参数：
-
-- `--workdir .mabsyn_work`：结果 JSON、汇总文件和缓存的根目录
-- `--abc-bin`：显式指定 `ABC` 路径
-- `--dataset-root`：包含 `.blif` 文件的根目录
-- `--design`：运行 dataset root 下某一个精确 design；省略时会运行所有发现到的 design
-- `--steps`：固定序列长度，或每个 episode 的步数
-- `--episodes`：该方法使用的总 episode / 迭代次数
-- `--seed`：随机种子
-- `--actions`：以逗号分隔的动作覆盖列表
-- `--result-json`：可选的显式汇总输出路径
-- `--external-monitor`：将每个 design 作为受外部监控的子进程运行，并把 `runtime` / `peak_memory` 回填到结果 JSON 中
-- `--debug-search`：为 `baseline_mab` 启用详细的逐 episode 调试产物
-
-各方法特有参数保持不变，包括 `baseline_mab` 的 `--ucb-c`，以及 `linucb` 的 `--alpha`、`--linucb-alpha`、`--lambda`、`--linucb-lambda`、`--long-term-rollouts` 和 `--long-term-horizon`。
-
-输出：
-
-- 默认根目录为 `.mabsyn_work/`
-- `baseline_mab` 和 `linucb` 不再写出默认汇总 `*_results.json` 文件；如果需要请传入 `--result-json`
-- 按 benchmark 划分的结果存储在 `.mabsyn_work/results/baseline_mab/` 和 `.mabsyn_work/results/linucb/` 下
-- 启用 `--debug-search` 时，`baseline_mab` 会在结果 JSON 同目录写出 `.debug.csv` 和 `.debug.json`
-- 汇总 CSV 会写入 `.mabsyn_work/results/summary.csv` 或各方法对应的汇总路径
-- LinUCB 缓存文件会写入 `.mabsyn_work/cache/linucb/`
-
-## 测试
-
-该仓库使用标准库 `unittest` 测试套件：
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-## 外部监控
-
-当前所有运行时间和峰值内存统计都应来自外部监控器，而不是内部的 ABC 插桩。
-
-- 使用 `run-search --external-monitor` 启用受监控执行
-- 在批处理模式下，CLI 会自动为每个 design 启动一个子进程，从而让每个 design 都获得独立的外部测量 `runtime_sec` 和 `peak_memory_kb`
-- 在 `run-search` 之后，运行已有的 `summarize` 命令来生成 `summary.csv`
-
-## 超参数调优
-
-对于 `alphasyn`、`baseline_mab` 和 `baseline_mab_prefix`，仓库提供了一个网格搜索调优驱动脚本：
-
-```bash
-python scripts/grid_search_tuning.py \
-  --algorithms alphasyn baseline_mab baseline_mab_prefix \
-  --dataset-root tc_public \
-  --design tc_public_1/input.blif \
-  --design tc_public_2/input.blif \
+python3 scripts/grid_search_tuning.py \
+  --dataset-root benchmarks/EPFL --design adder.blif \
   --max-trials-per-algorithm 3
 ```
 
-行为：
+结果位于 `.grid_search/`；`--grid-config` 可指定自定义 JSON 参数网格。
 
-- 每个参数组合都会在各自隔离的 workdir 中运行
-- `run-search` 会带上 `--external-monitor` 调用
-- 脚本会自动运行各算法对应的 `summarize`
-- 每次 trial 只记录它自己的 `summary.csv`
-- 当所有 trial 结束后，会使用 `compare_algorithm_summaries.py` 对所有已选算法的全部 trial summary 统一重新评分
-- 结果会写入 `.grid_search/`
-
-默认输出：
-
-- `.grid_search/alphasyn/results.csv`
-- `.grid_search/baseline_mab/results.csv`
-- `.grid_search/baseline_mab_prefix/results.csv`
-- `.grid_search/all_results.csv`
-- `.grid_search/global_compare/aggregate.csv`
-- `.grid_search/global_compare/details.csv`
-
-你可以使用 JSON 文件覆盖默认网格：
+动作评估分为静态单步评估、已有搜索前缀评估和完整搜索消融：
 
 ```bash
-python scripts/grid_search_tuning.py --grid-config your_grid.json
+python3 scripts/evaluate_actions_static.py \
+  --dataset-root benchmarks/EPFL --design adder.blif --action-label fraig
+
+python3 scripts/evaluate_actions_prefixes.py \
+  --result-path .alphasyn_work/results --max-prefixes-per-design 5 --action-label fraig
+
+python3 scripts/evaluate_actions_search_ablation.py \
+  --dataset-root benchmarks/EPFL --design adder.blif \
+  --config-json scripts/action_ablation_config.example.json --action-label fraig
 ```
 
-示例网格文件：
+结果位于 `.action_eval/`。完整搜索消融会复用输出目录中已存在的预设汇总；更换电路或参数后，应使用新的 `--output-root`。各脚本的 `--help` 列出完整选项。
 
-```json
-{
-  "alphasyn": {
-    "sequence-length": [8, 10],
-    "search-iterations": [10, 20],
-    "cpuct": [0.5, 1.0],
-    "mu-discount": [0.8, 0.9],
-    "seed": [0]
-  },
-  "baseline_mab": {
-    "steps": [8, 10],
-    "episodes": [10, 20],
-    "ucb-c": [0.4, 1.0],
-    "seed": [0]
-  },
-  "baseline_mab_prefix": {
-    "steps": [8, 10],
-    "episodes": [10, 20],
-    "ucb-c": [0.2, 0.4],
-    "seed": [0]
-  }
-}
-```
-
-## 动作评估
-
-仓库提供了三个脚本，用于评估候选 `ABC` 命令是否值得加入动作空间。
-
-内置候选标签包括：
-
-- `fraig`
-- `fx` 映射到 `renode; sop; fx; strash`
-- `mfs` 映射到 `renode; mfs; strash`
-- `dsd` 映射到 `dsd; strash`
-- `dch` 映射到 `dch; strash`
-- `extract`
-- `extract -a`
-- `collapse` 映射到 `collapse; strash`
-
-### 第 1 步：静态单命令评估
-
-在每个 design 上执行 `strash` 之后，对每个候选命令各运行一次；然后使用相同的四指标排序规则，对所有候选命令以及 `baseline` 空操作进行比较：
+## 开发与测试
 
 ```bash
-python scripts/evaluate_actions_static.py \
-  --dataset-root tc_public \
-  --design tc_public_1/input.blif \
-  --design tc_public_2/input.blif
+python3 -m unittest discover -s tests -v
 ```
 
-输出：
-
-- `.action_eval/static/raw_details.csv`
-- `.action_eval/static/summaries/*.csv`
-- `.action_eval/static/compare/aggregate.csv`
-- `.action_eval/static/compare/details.csv`
-
-### 第 2 步：中间状态单步评估
-
-从已有搜索结果 JSON 文件中采样中间前缀，重建这些状态，并从每个采样状态出发，对一个额外命令进行基准测试：
-
-```bash
-python scripts/evaluate_actions_prefixes.py \
-  --result-path .alphasyn_work/results \
-  --max-prefixes-per-design 10
-```
-
-输出：
-
-- `.action_eval/prefixes/raw_details.csv`
-- `.action_eval/prefixes/summaries/*.csv`
-- `.action_eval/prefixes/compare/aggregate.csv`
-- `.action_eval/prefixes/compare/details.csv`
-
-### 第 3 步：完整搜索消融实验
-
-针对多个算法和动作预设运行完整的 `run-search + summarize` 实验，然后把所有实验统一做全局比较：
-
-```bash
-python scripts/evaluate_actions_search_ablation.py \
-  --algorithms alphasyn baseline_mab baseline_mab_prefix \
-  --dataset-root tc_public \
-  --config-json scripts/action_ablation_config.example.json \
-  --action-label fraig
-```
-
-默认会创建以下预设：
-
-- `baseline`
-- `plus_fraig`
-- `plus_fx`
-- `plus_mfs`
-- `plus_dsd`
-- `plus_dch`
-- `plus_extract`
-- `plus_extract-a`
-- `plus_collapse`
-
-你还可以提供：
-
-- `--action-label ...`：只测试候选标签的一个子集
-- `--preset-json your_presets.json`：完全控制预设定义
-- `--config-json your_algo_args.json`：为各算法设置 `run-search` 参数
-- `--include-combined-preset`：添加一个包含所有已选候选标签的预设
-
-示例 `--config-json`：
-
-```json
-{
-  "alphasyn": {
-    "sequence-length": 10,
-    "search-iterations": 20,
-    "cpuct": 1.0,
-    "mu-discount": 0.9,
-    "seed": 0
-  },
-  "baseline_mab": {
-    "steps": 10,
-    "episodes": 20,
-    "ucb-c": 1.0,
-    "seed": 0
-  },
-  "baseline_mab_prefix": {
-    "steps": 10,
-    "episodes": 20,
-    "ucb-c": 0.4,
-    "seed": 0
-  }
-}
-```
-
-输出：
-
-- `.action_eval/search_ablation/<algorithm>/trials.csv`
-- `.action_eval/search_ablation/<algorithm>/failures.csv`
-- `.action_eval/search_ablation/<algorithm>/results.csv`
-- `.action_eval/search_ablation/all_results.csv`
-- `.action_eval/search_ablation/failures.csv`
-- `.action_eval/search_ablation/global_compare/aggregate.csv`
-- `.action_eval/search_ablation/global_compare/details.csv`
-
-复用行为：
-
-- 如果某个预设的 workdir 中已经包含预期的 `summary.csv`，第 3 步会直接复用它，并跳过该预设的 `run-search` 和 `summarize`
-- 如果想强制重跑某个预设，请删除 `.action_eval/search_ablation/<algorithm>/` 下对应的预设目录
-
-失败处理行为：
-
-- 第 3 步会为每个预设一次只运行一个 design
-- 如果某个预设下有一个 design 崩溃，失败会被记录到 `failures.csv` 中，后续 design 会继续运行
-- 只要至少有一个 design 成功并且能够生成 `summary.csv`，该预设仍会参与最终比较
-
-## 跨算法比较
-
-```bash
-python compare_algorithm_summaries.py \
-  --output your_aggregate.csv \
-  --details-output your_details.csv
+```text
+alphasyn/                       MCTS 搜索与 ABC 后端
+hybridsyn/                      UCB1 + MCTS 混合搜索
+SASyn/                          模拟退火搜索
+MABSyn/                         UCB1、前缀缓存 UCB1、LinUCB
+benchmarks/EPFL/                EPFL 电路
+benchmarks/VTR/                 VTR 电路
+scripts/                       调优、动作评估和外部监控
+compare_algorithm_summaries.py  跨算法比较
+external_monitoring.py         CLI 外部监控封装
+tests/                         自动化测试
 ```

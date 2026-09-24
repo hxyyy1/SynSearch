@@ -22,6 +22,8 @@ import sys
 import time
 from typing import Dict, List, Optional, Tuple
 
+from alphasyn.dataset import discover_blif_designs
+
 from external_monitoring import (
     is_external_monitor_active,
     remove_flag,
@@ -49,7 +51,7 @@ actions = [
 # 可调参数
 # ------------------------------
 ABC_BIN = os.environ.get("ABC_BIN", "abc")
-BENCHMARK_DIR = "./tc_public"
+BENCHMARK_DIR = "./benchmarks"
 RESULT_JSON = "baseline_results.json"
 
 N_EPISODES = 50
@@ -68,7 +70,7 @@ RANDOM_SEED = 0
 
 def natural_sort_key(text: str) -> List[object]:
     """
-    按数字自然排序，避免 tc_public_10 排在 tc_public_2 前面。
+    按数字自然排序，避免 design_10 排在 design_2 前面。
     """
     parts = re.split(r"(\d+)", text)
     key: List[object] = []
@@ -843,13 +845,10 @@ def _resolve_local_path(path: Path) -> Path:
 
 
 def _discover_designs_or_exit(dataset_root: Path) -> dict[str, str]:
-    files = find_blif_files(str(dataset_root))
-    if not files:
+    designs = discover_blif_designs(dataset_root)
+    if not designs:
         raise SystemExit(f"未找到 .blif 文件，请检查目录: {dataset_root}")
-    return {
-        os.path.relpath(os.path.abspath(blif_path), str(dataset_root.resolve())).replace("\\", "/"): blif_path
-        for blif_path in files
-    }
+    return {name: str(path) for name, path in designs.items()}
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -859,7 +858,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser("run-search", help="Run baseline MAB search.")
     run.add_argument("--workdir", type=Path, default=Path(result_utils.DEFAULT_WORKDIR_NAME))
     run.add_argument("--abc-bin", default=ABC_BIN)
-    run.add_argument("--dataset-root", type=Path, default=Path("tc_public"))
+    run.add_argument("--dataset-root", type=Path, default=Path("benchmarks"))
     run.add_argument("--design", help="Single .blif filename under dataset-root. Default: run all.")
     run.add_argument("--steps", type=int, default=K_STEPS)
     run.add_argument("--episodes", type=int, default=N_EPISODES)

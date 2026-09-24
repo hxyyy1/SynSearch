@@ -13,7 +13,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Step 1: evaluate candidate ABC commands directly on strashed BLIF designs."
     )
-    parser.add_argument("--dataset-root", type=Path, default=Path("tc_public"))
+    parser.add_argument("--dataset-root", type=Path, default=Path("benchmarks"))
     parser.add_argument(
         "--design",
         action="append",

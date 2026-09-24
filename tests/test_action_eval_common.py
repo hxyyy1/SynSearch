@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from scripts import action_eval_common
 
 
 class ActionEvalCommonTests(unittest.TestCase):
+    def test_resolve_abc_bin_honors_environment_and_explicit_override(self) -> None:
+        with patch.dict("os.environ", {"ABC_BIN": "/opt/abc/bin/abc"}):
+            self.assertEqual(action_eval_common.resolve_abc_bin(None), "/opt/abc/bin/abc")
+            self.assertEqual(action_eval_common.resolve_abc_bin("custom-abc"), "custom-abc")
+
     def test_load_action_specs_uses_default_candidates(self) -> None:
         specs = action_eval_common.load_action_specs(labels=["fraig", "mfs"], raw_specs=[])
         self.assertEqual(specs["fraig"], "fraig")

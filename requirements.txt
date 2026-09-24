@@ -1,0 +1,2 @@
+# Required by LinUCB and the full test suite.
+numpy>=1.21

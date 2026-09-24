@@ -54,7 +54,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="alphasyn")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    prepare = subparsers.add_parser("prepare-data", help="Scan tc_public and emit a manifest.")
+    prepare = subparsers.add_parser("prepare-data", help="Scan benchmark BLIF files and emit a manifest.")
     prepare.add_argument(
         "--workdir",
         type=Path,
@@ -64,7 +64,7 @@ def _build_parser() -> argparse.ArgumentParser:
     prepare.add_argument(
         "--dataset-root",
         type=Path,
-        default=Path("tc_public"),
+        default=Path("benchmarks"),
         help="Directory containing the target .blif files.",
     )
 
@@ -80,7 +80,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("ABC_BIN"),
         help="Path to ABC executable.",
     )
-    run.add_argument("--dataset-root", type=Path, default=Path("tc_public"))
+    run.add_argument("--dataset-root", type=Path, default=Path("benchmarks"))
     run.add_argument("--design", help="Single .blif filename under dataset-root. Default: run all.")
     run.add_argument("--sequence-length", type=int, default=24)
     run.add_argument("--search-iterations", type=int, default=64)

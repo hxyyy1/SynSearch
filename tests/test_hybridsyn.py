@@ -383,9 +383,9 @@ class HybridSynTests(unittest.TestCase):
             result_path = results_dir / f"{design_name.replace('/', '__')}.json"
             result_path.write_text(json.dumps(payload, indent=2), encoding="ascii")
 
-        write_result("tc_public_10/input.blif")
-        write_result("tc_public_2/input.blif")
-        write_result("tc_public_1/input.blif")
+        write_result("design_10/input.blif")
+        write_result("design_2/input.blif")
+        write_result("design_1/input.blif")
 
         summarize_exit = hybridsyn_cli.main(
             [
@@ -400,7 +400,7 @@ class HybridSynTests(unittest.TestCase):
             rows = list(csv.DictReader(handle))
         self.assertEqual(
             [row["design_name"] for row in rows],
-            ["tc_public_1/input.blif", "tc_public_2/input.blif", "tc_public_10/input.blif"],
+            ["design_1/input.blif", "design_2/input.blif", "design_10/input.blif"],
         )
 
     def test_cli_parser_exposes_external_monitor_flag(self) -> None:

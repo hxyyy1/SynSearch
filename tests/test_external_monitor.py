@@ -72,7 +72,7 @@ class ExternalMonitorTests(unittest.TestCase):
                 {
                     "results": [
                         {
-                            "benchmark": "tc_public_1/input.blif",
+                            "benchmark": "design_1/input.blif",
                             "runtime_sec": 1.0,
                             "peak_memory_kb": 2.0,
                         }

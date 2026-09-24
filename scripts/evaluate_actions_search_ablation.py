@@ -88,7 +88,7 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=tuple(ALGORITHMS),
         default=["alphasyn", "baseline_mab", "baseline_mab_prefix"],
     )
-    parser.add_argument("--dataset-root", type=Path, default=Path("tc_public"))
+    parser.add_argument("--dataset-root", type=Path, default=Path("benchmarks"))
     parser.add_argument(
         "--design",
         action="append",

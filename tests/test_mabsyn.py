@@ -95,7 +95,7 @@ class MABSynTests(unittest.TestCase):
 
     def test_debug_trace_csv_and_json_are_written_for_synthetic_result(self) -> None:
         result = {
-            "benchmark": "tc_public_1/input.blif",
+            "benchmark": "design_1/input.blif",
             "status": "ok",
             "best": {"nodes": 10, "level": 3, "recipe_str": "balance"},
             "config": {
@@ -134,8 +134,8 @@ class MABSynTests(unittest.TestCase):
             ],
         }
         baseline_mab.write_result_artifacts(result)
-        debug_csv_path = Path(result_utils.get_results_root()) / "baseline_mab" / "tc_public_1__input.debug.csv"
-        debug_json_path = Path(result_utils.get_results_root()) / "baseline_mab" / "tc_public_1__input.debug.json"
+        debug_csv_path = Path(result_utils.get_results_root()) / "baseline_mab" / "design_1__input.debug.csv"
+        debug_json_path = Path(result_utils.get_results_root()) / "baseline_mab" / "design_1__input.debug.json"
         self.assertTrue(debug_csv_path.exists())
         self.assertTrue(debug_json_path.exists())
         with debug_csv_path.open("r", encoding="utf-8", newline="") as handle:
@@ -144,7 +144,7 @@ class MABSynTests(unittest.TestCase):
         self.assertEqual(rows[0]["episode_sequence"], "rewrite")
         with debug_json_path.open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
-        self.assertEqual(payload["benchmark"], "tc_public_1/input.blif")
+        self.assertEqual(payload["benchmark"], "design_1/input.blif")
         self.assertEqual(payload["episodes"][0]["episode"], 1)
         self.assertEqual(payload["episodes"][0]["steps"][0]["selected_action"], "rewrite")
         self.assertEqual(payload["episodes"][0]["steps"][0]["actions"][0]["action"], "rewrite")
@@ -288,21 +288,21 @@ class MABSynTests(unittest.TestCase):
         path = result_utils.write_benchmark_result(
             "baseline_mab",
             {
-                "benchmark": "tc_public_1/input.blif",
+                "benchmark": "design_1/input.blif",
                 "best": {"nodes": 10, "level": 3},
                 "runtime_sec": 0.25,
                 "peak_memory_kb": 2048,
             },
         )
         self.assertTrue(path.startswith(workdir))
-        self.assertTrue(path.endswith("results/baseline_mab/tc_public_1__input.json"))
+        self.assertTrue(path.endswith("results/baseline_mab/design_1__input.json"))
         self.assertTrue(Path(path).exists())
 
     def test_summarize_results_generates_csv_for_synthetic_rows(self) -> None:
         result_utils.write_benchmark_result(
             "baseline_mab",
             {
-                "benchmark": "tc_public_1/input.blif",
+                "benchmark": "design_1/input.blif",
                 "best": {"nodes": 12, "level": 4},
                 "runtime_sec": 1.5,
                 "peak_memory_kb": 2048,
@@ -326,7 +326,7 @@ class MABSynTests(unittest.TestCase):
                 "peak_memory_kb",
             ],
         )
-        self.assertEqual(rows[1][0], "tc_public_1/input.blif")
+        self.assertEqual(rows[1][0], "design_1/input.blif")
         self.assertIn("steps=", rows[1][1])
         self.assertEqual(rows[1][2], "12")
         self.assertEqual(rows[1][5], "2048")
@@ -354,7 +354,7 @@ class MABSynTests(unittest.TestCase):
 
     def test_run_search_subcommand_handles_batch_without_aggregate_json(self) -> None:
         baseline_result = {
-            "benchmark": "tc_public_1/input.blif",
+            "benchmark": "design_1/input.blif",
             "status": "ok",
             "initial": {"nodes": 10, "level": 2},
             "best": {"nodes": 9, "level": 2, "recipe_str": "balance"},
@@ -363,7 +363,7 @@ class MABSynTests(unittest.TestCase):
             "peak_memory_kb": 1024,
         }
         linucb_result = {
-            "benchmark": "tc_public_1/input.blif",
+            "benchmark": "design_1/input.blif",
             "status": "ok",
             "initial": {"nodes": 10, "level": 2},
             "best": {"nodes": 8, "level": 2, "recipe_str": "rewrite", "recipe_best": "rewrite"},
@@ -375,7 +375,7 @@ class MABSynTests(unittest.TestCase):
         with patch.object(
             baseline_mab,
             "_discover_designs_or_exit",
-            return_value={"tc_public_1/input.blif": "/tmp/mock.blif"},
+            return_value={"design_1/input.blif": "/tmp/mock.blif"},
         ):
             with patch.object(baseline_mab, "optimize_one_benchmark", return_value=baseline_result):
                 baseline_mab.main(["run-search", "--workdir", result_utils.get_workdir()])
@@ -383,7 +383,7 @@ class MABSynTests(unittest.TestCase):
         with patch.object(
             linucb,
             "_discover_designs_or_exit",
-            return_value={"tc_public_1/input.blif": "/tmp/mock.blif"},
+            return_value={"design_1/input.blif": "/tmp/mock.blif"},
         ):
             with patch.object(linucb, "optimize_one_benchmark", return_value=linucb_result):
                 linucb.main(["run-search", "--workdir", result_utils.get_workdir()])

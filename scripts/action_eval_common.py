@@ -128,16 +128,14 @@ def evaluate_abc_script(abc_bin: str, script: str) -> ActionMeasurement:
 
 
 def resolve_abc_bin(raw_abc_bin: str | None) -> str:
-    if raw_abc_bin:
-        return raw_abc_bin
+    configured_bin = raw_abc_bin or os.environ.get("ABC_BIN")
+    if configured_bin:
+        return configured_bin
     for candidate in ("abc", "yosys-abc", "berkeley-abc"):
         resolved = shutil.which(candidate)
         if resolved:
             return resolved
-    fallback = REPO_ROOT.parent / "abc" / "abc"
-    if fallback.exists():
-        return str(fallback)
-    raise SystemExit("ABC executable not found. Pass --abc-bin explicitly.")
+    raise SystemExit("ABC executable not found. Pass --abc-bin or set ABC_BIN.")
 
 
 def load_action_specs(
@@ -332,4 +330,3 @@ def resolve_algorithm_actions(
     if algorithm_key in {"alphasyn", "hybridsyn", "sasyn"}:
         return action_labels
     return [ACTION_TO_ABC_COMMAND[label] for label in action_labels]
-

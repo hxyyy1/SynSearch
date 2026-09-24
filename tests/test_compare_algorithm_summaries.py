@@ -35,7 +35,7 @@ class CompareAlgorithmSummariesTests(unittest.TestCase):
         specs = compare_algorithm_summaries._parse_summary_specs([])
         self.assertEqual(
             [spec.name for spec in specs],
-            ["MCTSyn", "HybridSyn", "SASyn", "MABSyn-UCB1", "MABSyn-UCB1Prefix"],
+            ["AlphaSyn", "HybridSyn", "SASyn", "MABSyn-UCB1", "MABSyn-UCB1Prefix"],
         )
 
     def test_score_for_rank_uses_minimum_threshold_after_sixth_place(self) -> None:
@@ -93,7 +93,7 @@ class CompareAlgorithmSummariesTests(unittest.TestCase):
         with redirect_stdout(stdout):
             exit_code = compare_algorithm_summaries.main(
                 [
-                    f"--summary=MCTSyn={mct_path}",
+                    f"--summary=AlphaSyn={mct_path}",
                     f"--summary=HybridSyn={hybrid_path}",
                     f"--summary=SASyn={sa_path}",
                     f"--summary=MABSyn={mab_path}",
@@ -109,7 +109,7 @@ class CompareAlgorithmSummariesTests(unittest.TestCase):
 
         with aggregate_path.open("r", encoding="utf-8", newline="") as handle:
             rows = list(csv.DictReader(handle))
-        self.assertEqual([row["algorithm"] for row in rows], ["HybridSyn", "SASyn", "MABSyn", "MCTSyn"])
+        self.assertEqual([row["algorithm"] for row in rows], ["HybridSyn", "SASyn", "MABSyn", "AlphaSyn"])
         self.assertEqual(rows[0]["design_count"], "2")
         self.assertAlmostEqual(float(rows[0]["final_score"]), 18.1)
         self.assertAlmostEqual(float(rows[1]["final_score"]), 16.8)
@@ -120,7 +120,7 @@ class CompareAlgorithmSummariesTests(unittest.TestCase):
             detail_rows = list(csv.DictReader(handle))
         self.assertEqual(len(detail_rows), 8)
         d1_rows = [row for row in detail_rows if row["design"] == "d1"]
-        self.assertEqual([row["algorithm"] for row in d1_rows], ["HybridSyn", "SASyn", "MABSyn", "MCTSyn"])
+        self.assertEqual([row["algorithm"] for row in d1_rows], ["HybridSyn", "SASyn", "AlphaSyn", "MABSyn"])
         self.assertEqual([row["rank"] for row in d1_rows], ["1", "1", "3", "3"])
         self.assertEqual(d1_rows[0]["and_rank"], "2")
         self.assertEqual(d1_rows[0]["and_score"], "9")
@@ -154,7 +154,7 @@ class CompareAlgorithmSummariesTests(unittest.TestCase):
 
         exit_code = compare_algorithm_summaries.main(
             [
-                f"--summary=MCTSyn={mct_path}",
+                f"--summary=AlphaSyn={mct_path}",
                 f"--summary=SASyn={sa_path}",
                 f"--output={aggregate_path}",
                 f"--details-output={detail_path}",
@@ -167,7 +167,7 @@ class CompareAlgorithmSummariesTests(unittest.TestCase):
         self.assertEqual(len(rows), 3)
         self.assertEqual(
             [(row["algorithm"], row["variant_label"]) for row in rows],
-            [("MCTSyn", "cpuct=2.0"), ("SASyn", "baseline"), ("MCTSyn", "cpuct=1.0")],
+            [("AlphaSyn", "cpuct=2.0"), ("SASyn", "baseline"), ("AlphaSyn", "cpuct=1.0")],
         )
         self.assertEqual([row["design_count"] for row in rows], ["2", "2", "2"])
         self.assertAlmostEqual(float(rows[0]["final_score"]), 18.0)
@@ -179,7 +179,7 @@ class CompareAlgorithmSummariesTests(unittest.TestCase):
         self.assertEqual(len(detail_rows), 6)
         self.assertEqual(
             [(row["algorithm"], row["variant_label"]) for row in detail_rows if row["design"] == "d1"],
-            [("MCTSyn", "cpuct=2.0"), ("SASyn", "baseline"), ("MCTSyn", "cpuct=1.0")],
+            [("AlphaSyn", "cpuct=2.0"), ("SASyn", "baseline"), ("AlphaSyn", "cpuct=1.0")],
         )
         self.assertEqual(
             [row["rank"] for row in detail_rows if row["design"] == "d1"],
@@ -213,7 +213,7 @@ class CompareAlgorithmSummariesTests(unittest.TestCase):
 
         exit_code = compare_algorithm_summaries.main(
             [
-                f"--summary=MCTSyn={mct_path}",
+                f"--summary=AlphaSyn={mct_path}",
                 f"--summary=MABSyn={mab_path}",
                 f"--output={aggregate_path}",
                 f"--details-output={detail_path}",
@@ -235,23 +235,23 @@ class CompareAlgorithmSummariesTests(unittest.TestCase):
             mct_path,
             ["design_name", "variant_label", "final_and", "final_lev", "total_runtime_sec"],
             [
-                ["tc_public_1/input.blif", "cpuct=1.0", 100, 10, 5.0],
-                ["tc_public_2/input.blif", "cpuct=1.0", 110, 11, 6.0],
+                ["design_1/input.blif", "cpuct=1.0", 100, 10, 5.0],
+                ["design_2/input.blif", "cpuct=1.0", 110, 11, 6.0],
             ],
         )
         self._write_csv(
             prefix_path,
             ["file", "variant_label", "and", "lev", "runtime_sec"],
             [
-                ["tc_public_1/input.blif", "method=baseline_mab_prefix,steps=10,iters=100", "-", "-", "-"],
-                ["tc_public_1/input.blif", "method=baseline_mab_prefix,steps=10,iters=20", 95, 9, 4.5],
-                ["tc_public_2/input.blif", "method=baseline_mab_prefix,steps=10,iters=20", 108, 10, 5.5],
+                ["design_1/input.blif", "method=baseline_mab_prefix,steps=10,iters=100", "-", "-", "-"],
+                ["design_1/input.blif", "method=baseline_mab_prefix,steps=10,iters=20", 95, 9, 4.5],
+                ["design_2/input.blif", "method=baseline_mab_prefix,steps=10,iters=20", 108, 10, 5.5],
             ],
         )
 
         exit_code = compare_algorithm_summaries.main(
             [
-                f"--summary=MCTSyn={mct_path}",
+                f"--summary=AlphaSyn={mct_path}",
                 f"--summary=MABSyn-UCB1Prefix={prefix_path}",
                 f"--output={aggregate_path}",
                 f"--details-output={detail_path}",
@@ -261,9 +261,9 @@ class CompareAlgorithmSummariesTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         with detail_path.open("r", encoding="utf-8", newline="") as handle:
             detail_rows = list(csv.DictReader(handle))
-        tc1_rows = [row for row in detail_rows if row["design"] == "tc_public_1/input.blif"]
-        self.assertEqual(len(tc1_rows), 2)
-        self.assertEqual([row["algorithm"] for row in tc1_rows], ["MABSyn-UCB1Prefix", "MCTSyn"])
+        design1_rows = [row for row in detail_rows if row["design"] == "design_1/input.blif"]
+        self.assertEqual(len(design1_rows), 2)
+        self.assertEqual([row["algorithm"] for row in design1_rows], ["MABSyn-UCB1Prefix", "AlphaSyn"])
 
     def test_compare_summaries_skips_non_overlapping_variants(self) -> None:
         mct_path = self.workdir / "mct.csv"
@@ -291,7 +291,7 @@ class CompareAlgorithmSummariesTests(unittest.TestCase):
 
         exit_code = compare_algorithm_summaries.main(
             [
-                f"--summary=MCTSyn={mct_path}",
+                f"--summary=AlphaSyn={mct_path}",
                 f"--summary=SASyn={sa_path}",
                 f"--output={aggregate_path}",
                 f"--details-output={detail_path}",
@@ -303,7 +303,7 @@ class CompareAlgorithmSummariesTests(unittest.TestCase):
             rows = list(csv.DictReader(handle))
         self.assertEqual(
             [(row["algorithm"], row["variant_label"], row["design_count"]) for row in rows],
-            [("SASyn", "baseline", "2"), ("MCTSyn", "shared", "2")],
+            [("SASyn", "baseline", "2"), ("AlphaSyn", "shared", "2")],
         )
 
 
